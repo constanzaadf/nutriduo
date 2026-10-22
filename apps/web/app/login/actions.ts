@@ -23,7 +23,12 @@ export async function sendMagicLink(_prev: LoginState, formData: FormData): Prom
     email: parsed.data,
     options: { emailRedirectTo: `${origin}/auth/callback` },
   });
-  if (error) return { ok: false, message: `No se pudo enviar el enlace: ${error.message}` };
+  if (error) {
+    if (/rate limit/i.test(error.message) || error.status === 429) {
+      return { ok: false, message: "Se alcanzó el límite de correos por hora del servicio de correo. Espera alrededor de una hora y vuelve a pedir el enlace." };
+    }
+    return { ok: false, message: `No se pudo enviar el enlace: ${error.message}` };
+  }
   return { ok: true, message: `Te enviamos un enlace a ${parsed.data}. Ábrelo en este mismo dispositivo para entrar.` };
 }
 
