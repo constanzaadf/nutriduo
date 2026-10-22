@@ -11,7 +11,13 @@ export async function sendMagicLink(_prev: LoginState, formData: FormData): Prom
   const parsed = z.string().trim().email().safeParse(formData.get("email"));
   if (!parsed.success) return { ok: false, message: "Escribe un correo válido." };
   const h = await headers();
-  const origin = process.env.NEXT_PUBLIC_SITE_URL ?? `${h.get("x-forwarded-proto") ?? "http"}://${h.get("host")}`;
+  // La dirección real desde donde se pidió el enlace (en Vercel, el dominio público).
+  // NEXT_PUBLIC_SITE_URL queda solo como respaldo: se fija al compilar y puede quedar en localhost.
+  const host = h.get("x-forwarded-host") ?? h.get("host");
+  const proto = h.get("x-forwarded-proto") ?? (host?.startsWith("localhost") ? "http" : "https");
+  const fromRequest = host ? `${proto}://${host}` : null;
+  const configured = process.env.NEXT_PUBLIC_SITE_URL?.trim().replace(/\/+$/, "");
+  const origin = fromRequest ?? configured ?? "http://localhost:3000";
   const supabase = await createClient();
   const { error } = await supabase.auth.signInWithOtp({
     email: parsed.data,
