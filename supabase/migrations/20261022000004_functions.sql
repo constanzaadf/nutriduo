@@ -258,8 +258,14 @@ begin
 
   insert into public.calculation_runs (household_id, profile_id, engine, engine_version, input_hash, inputs, outputs, created_by)
     values (v_event.household_id, null, 'portions', p_run ->> 'engine_version', p_run ->> 'input_hash',
-            coalesce(p_run -> 'inputs', '{}'::jsonb), coalesce(p_run -> 'outputs', '{}'::jsonb), auth.uid())
+            jsonb_set(coalesce(p_run -> 'inputs', '{}'::jsonb), '{event_id}', to_jsonb(p_event::text)),
+            coalesce(p_run -> 'outputs', '{}'::jsonb), auth.uid())
     returning id into v_run;
+
+  -- Si la comida sale de un lote, sus asignaciones se rehacen junto con las porciones
+  if v_event.batch_id is not null then
+    delete from public.batch_allocations where event_id = p_event;
+  end if;
 
   for v_p in select * from jsonb_array_elements(p_portions) loop
     select id into v_participant from public.meal_participants
@@ -282,6 +288,10 @@ begin
       insert into public.portion_ingredients (portion_id, ingredient_id, kind, label, grams, state, units)
         values (v_portion, nullif(v_line ->> 'ingredient_id', '')::uuid, v_line ->> 'kind', v_line ->> 'label',
                 (v_line ->> 'grams')::numeric, v_line ->> 'state', (v_line ->> 'units')::int);
+      if v_event.batch_id is not null and v_line ->> 'kind' = 'mix' and (v_line ->> 'grams')::numeric > 0 then
+        insert into public.batch_allocations (batch_id, event_id, participant_id, grams_cooked)
+          values (v_event.batch_id, p_event, v_participant, (v_line ->> 'grams')::numeric);
+      end if;
     end loop;
   end loop;
 
@@ -338,6 +348,24 @@ begin
     raise exception 'Lote no encontrado' using errcode = 'no_data_found';
   end if;
 end $$;
+
+
+-- Gramos de las porciones de un conjunto de comidas, respetando la visibilidad
+-- "summary": se ven las líneas de la pareja aunque su fila de macros no sea visible.
+create or replace function public.event_portion_lines(p_events uuid[])
+returns table (event_id uuid, participant_id uuid, profile_id uuid, label text, grams numeric, kind text, state text, units int)
+language sql stable security definer set search_path = public as $$
+  select mp.event_id, mp.id, mp.profile_id, pi.label, pi.grams, pi.kind, pi.state::text, pi.units
+  from public.meal_participants mp
+  join public.meal_events e on e.id = mp.event_id
+  join public.meal_portions po on po.participant_id = mp.id
+  join public.portion_ingredients pi on pi.portion_id = po.id
+  where mp.event_id = any (p_events)
+    and mp.active
+    and public.is_member(e.household_id)
+    and public.can_view_profile(mp.profile_id, 'summary')
+  order by mp.event_id, mp.id, pi.kind, pi.grams desc
+$$;
 
 grant execute on all functions in schema public to authenticated;
 revoke execute on all functions in schema public from anon;

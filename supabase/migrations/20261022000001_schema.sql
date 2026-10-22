@@ -377,6 +377,8 @@ create table public.meal_participants (
   date date not null,
   slot text not null,
   active boolean not null default true,
+  -- Ajustes individuales (modalidad C): {"extras":[{ingredient_id, grams, state, integer_unit_g}], "skip_sides":[ingredient_id]}
+  options jsonb not null default '{}'::jsonb check (jsonb_typeof(options) = 'object'),
   unique (event_id, profile_id)
 );
 create unique index meal_participants_one_per_slot on public.meal_participants (profile_id, date, slot) where active and slot <> 'extra';

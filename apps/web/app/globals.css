@@ -1,0 +1,85 @@
+@import "tailwindcss";
+
+/*
+  NutriDuo · sistema visual
+  Base crema y salvia (brief). Lo único llamativo: el "plato partido".
+  Cada persona tiene su tono —salvia y ciruela— y una comida compartida
+  es una sola tarjeta con las dos franjas.
+*/
+@theme {
+  --color-masa: #f6f1e7;      /* fondo */
+  --color-papel: #fffcf6;     /* superficies */
+  --color-avena: #e4dac7;     /* líneas */
+  --color-avena-fuerte: #cbbda3;
+  --color-tinta: #1f2d24;     /* texto: verde casi negro, no gris */
+  --color-tinta-suave: #5b6659;
+  --color-salvia: #5f7d58;    /* persona 1 y acción principal */
+  --color-salvia-claro: #e3eadc;
+  --color-salvia-oscuro: #3f5a3a;
+  --color-ciruela: #8a6680;   /* persona 2 */
+  --color-ciruela-claro: #efe4ec;
+  --color-miel: #a8792a;      /* desvío / estimado */
+  --color-miel-claro: #f5ead2;
+  --color-ladrillo: #9c4a3a;  /* error / bloqueo */
+  --color-ladrillo-claro: #f4e1dc;
+
+  --font-display: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
+  --font-sans: var(--font-figtree), ui-sans-serif, system-ui, sans-serif;
+
+  --radius-plato: 1.25rem;
+}
+
+@layer base {
+  html {
+    background: var(--color-masa);
+    color: var(--color-tinta);
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    font-family: var(--font-sans);
+    font-size: 1rem;
+    line-height: 1.5;
+  }
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-display);
+    letter-spacing: -0.01em;
+    line-height: 1.15;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-salvia);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation: none !important;
+      transition: none !important;
+    }
+  }
+}
+
+@layer components {
+  .cifra {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+  .campo {
+    @apply w-full rounded-xl border border-avena bg-papel px-3 py-2.5 text-[0.95rem] text-tinta placeholder:text-tinta-suave/60 focus:border-salvia focus:outline-none;
+  }
+  .etiqueta {
+    @apply mb-1 block text-sm font-medium text-tinta-suave;
+  }
+  /* Franja de color por persona en el plato partido */
+  .tono-0 {
+    --tono: var(--color-salvia);
+    --tono-claro: var(--color-salvia-claro);
+  }
+  .tono-1 {
+    --tono: var(--color-ciruela);
+    --tono-claro: var(--color-ciruela-claro);
+  }
+}

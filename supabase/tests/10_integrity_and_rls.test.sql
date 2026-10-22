@@ -152,6 +152,7 @@ select public.approve_meal_portions((select v::uuid from ctx where k = 'e1'), (s
   '{"engine_version":"1.0.0","input_hash":"abcd1234","inputs":{},"outputs":{}}');
 select tests.ok((select count(*) from public.meal_portions) = 1, 'A ve los macros solo de su porción');
 select tests.ok((select count(*) from public.portion_ingredients) = 2, 'pero ve los gramos de ambos (summary)');
+select tests.ok((select count(*) from public.event_portion_lines(array[(select v::uuid from ctx where k = 'e1')])) = 2, 'event_portion_lines entrega los gramos de ambos para el calendario');
 select tests.ok((select plan_status = 'approved' from public.meal_events where id = (select v::uuid from ctx where k = 'e1')), 'el evento queda aprobado');
 select tests.throws($$select public.approve_meal_portions('$$ || (select v from ctx where k = 'e1') || $$', $$ || (select v from ctx where k = 'ver1') || $$, '[]', '{"engine_version":"1"}')$$,
   'event_version_conflict', 'edición concurrente: aprobar con una versión vieja falla');
@@ -176,6 +177,7 @@ reset role;
 select tests.login('aaaaaaaa-0000-0000-0000-000000000001');
 set role authenticated;
 select tests.ok((select count(*) from public.portion_ingredients) = 1, 'con private, A ya no ve ni los gramos de B');
+select tests.ok((select count(*) from public.event_portion_lines(array[(select v::uuid from ctx where k = 'e1')])) = 1, 'ni a través de event_portion_lines');
 reset role;
 select tests.login('bbbbbbbb-0000-0000-0000-000000000002');
 set role authenticated;
