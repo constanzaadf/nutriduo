@@ -11,7 +11,7 @@ import { supabaseEnv } from "./server";
  */
 export function createAdminClient() {
   const { url } = supabaseEnv();
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
   if (!key) throw new Error("Falta SUPABASE_SERVICE_ROLE_KEY (solo servidor). Revisa .env.local.");
   return createSupabaseClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
 }
