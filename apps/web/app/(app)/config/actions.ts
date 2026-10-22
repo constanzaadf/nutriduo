@@ -319,3 +319,14 @@ export async function regenerateInvite() {
   await ctx.supabase.rpc("regenerate_invite_code", { p_household: ctx.household.id });
   revalidatePath("/config");
 }
+
+export async function changePassword(_prev: FormState, fd: FormData): Promise<FormState> {
+  const ctx = await requireContext();
+  const password = String(fd.get("password") ?? "");
+  if (password.length < 8) return { ok: false, message: "La contraseña debe tener al menos 8 caracteres." };
+  if (password.length > 72) return { ok: false, message: "La contraseña es demasiado larga." };
+  if (password !== String(fd.get("confirm") ?? "")) return { ok: false, message: "Las contraseñas no coinciden." };
+  const { error } = await ctx.supabase.auth.updateUser({ password });
+  if (error) return { ok: false, message: `No se pudo cambiar: ${error.message}` };
+  return { ok: true, message: "Contraseña guardada. Desde ahora puedes entrar con tu correo y esta contraseña." };
+}

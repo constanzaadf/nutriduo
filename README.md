@@ -32,7 +32,7 @@ nutriduo/
    ```
 4. **Desplegar.** En Vercel, importa el repo con *Root Directory* `apps/web` y las mismas variables de entorno.
 
-Primer uso: una persona crea el hogar y comparte el código de 8 caracteres; la otra se une. Cada uno completa su perfil y guarda una meta (calculada, indicada por un profesional o como pauta por porciones). Después: ingredientes → recetas → calendario.
+Primer uso: cada persona crea su cuenta con correo y contraseña (también hay enlace por correo como alternativa). Una persona crea el hogar y comparte el código de 8 caracteres; la otra se une. Cada uno completa su perfil y guarda una meta (calculada, indicada por un profesional o como pauta por porciones). Después: ingredientes → recetas → calendario.
 
 ## Pruebas
 

@@ -7,6 +7,7 @@ import { num, type GoalRow, type ProfileRow, type SlotTargetRow } from "@/lib/ty
 import { Notice, PageHeader, Panel, SectionTitle, Tag, Button } from "@/components/ui";
 import { ProfileForm } from "./profile-form";
 import { GoalForms } from "./goal-forms";
+import { PasswordForm } from "./password-form";
 import { addRestriction, regenerateInvite, removeRestriction, setVisibility } from "./actions";
 
 export const metadata: Metadata = { title: "Configuración" };
@@ -141,6 +142,12 @@ export default async function ConfigPage({ searchParams }: { searchParams: Promi
               </form>
             </Panel>
           ) : null}
+
+          <Panel>
+            <SectionTitle>Tu cuenta</SectionTitle>
+            <p className="mb-3 text-sm text-tinta-suave">Define o cambia tu contraseña para entrar sin esperar un correo.</p>
+            <PasswordForm />
+          </Panel>
 
           <Panel>
             <SectionTitle>Hogar</SectionTitle>
