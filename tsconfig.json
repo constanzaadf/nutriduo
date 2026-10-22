@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "paths": {
+      "@nutriduo/domain": ["./packages/domain/src/index.ts"],
+      "@nutriduo/nutrition-engine": ["./packages/nutrition-engine/src/index.ts"],
+      "@nutriduo/portion-engine": ["./packages/portion-engine/src/index.ts"],
+      "@nutriduo/shopping-engine": ["./packages/shopping-engine/src/index.ts"]
+    }
+  },
+  "include": ["./packages/*/src/**/*.ts", "packages/*/test/**/*.ts"]
+}

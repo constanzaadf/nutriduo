@@ -1,0 +1,23 @@
+{
+  "name": "nutriduo",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Planificación alimentaria coordinada para dos personas con objetivos distintos en una sola cocina.",
+  "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "test": "node --import tsx --test \"packages/*/test/**/*.test.ts\"",
+    "test:engines": "node --import tsx --test \"packages/*/test/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "pnpm --filter @nutriduo/web dev",
+    "build": "pnpm --filter @nutriduo/web build",
+    "db:test": "supabase test db"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
