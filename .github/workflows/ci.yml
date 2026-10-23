@@ -14,9 +14,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # Aún no hay pnpm-lock.yaml (se generará en el primer install local).
-      # Cuando exista en el repo: agrega `cache: pnpm` arriba y usa --frozen-lockfile.
-      - run: pnpm install --no-frozen-lockfile
+          cache: pnpm
+      # Instala exactamente lo que dice pnpm-lock.yaml; si un package.json cambió
+      # sin actualizar el lockfile, falla (el workflow "Lockfile" lo regenera).
+      - run: pnpm install --frozen-lockfile
       - name: Pruebas de los motores
         run: pnpm test
       - name: Tipos de los motores
