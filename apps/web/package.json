@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@nutriduo/domain": "workspace:*",
+    "@nutriduo/menu-engine": "workspace:*",
     "@nutriduo/nutrition-engine": "workspace:*",
     "@nutriduo/portion-engine": "workspace:*",
     "@nutriduo/shopping-engine": "workspace:*",

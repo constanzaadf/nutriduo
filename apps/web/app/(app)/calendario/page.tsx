@@ -4,14 +4,14 @@ import { requireContext, personTone } from "@/lib/session";
 import { loadEvents, SLOT_LABEL, SLOT_ORDER } from "@/lib/data/week";
 import { dayLabel, isoWeekOf, longDate, shiftWeek, todayIn, weekDays, weekRangeLabel } from "@/lib/dates";
 import { MealCard } from "@/components/meal-card";
-import { Button, LinkButton, PageHeader, PersonDot, cx } from "@/components/ui";
+import { Button, LinkButton, Notice, PageHeader, PersonDot, cx } from "@/components/ui";
 import { copyDay } from "./actions";
 
 export const metadata: Metadata = { title: "Calendario" };
 
 type View = "yo" | "pareja" | "hogar";
 
-export default async function CalendarPage({ searchParams }: { searchParams: Promise<{ semana?: string; vista?: string }> }) {
+export default async function CalendarPage({ searchParams }: { searchParams: Promise<{ semana?: string; vista?: string; menu?: string; pendientes?: string }> }) {
   const sp = await searchParams;
   const ctx = await requireContext();
   const today = todayIn(ctx.household.timezone);
@@ -35,8 +35,21 @@ export default async function CalendarPage({ searchParams }: { searchParams: Pro
       <PageHeader
         title="Calendario"
         lead={`Semana del ${weekRangeLabel(week)}.`}
-        actions={<LinkButton href={`/calendario/nuevo?fecha=${days.includes(today) ? today : days[0]}`}>Agregar comida</LinkButton>}
+        actions={
+          <>
+            <LinkButton href={`/calendario/semana?semana=${week < isoWeekOf(today) ? shiftWeek(isoWeekOf(today), 1) : week}`} kind="quiet">Proponer semana</LinkButton>
+            <LinkButton href={`/calendario/nuevo?fecha=${days.includes(today) ? today : days[0]}`}>Agregar comida</LinkButton>
+          </>
+        }
       />
+      {sp.menu ? (
+        <div className="mb-4">
+          <Notice tone={Number(sp.pendientes) > 0 ? "warn" : "ok"}>
+            Menú aplicado: {sp.menu} comidas{Number(sp.pendientes) > 0 ? `; ${sp.pendientes} quedaron en borrador porque no se pudo calcular su porción (ábrelas para ver por qué)` : ", todas con porciones calculadas"}.
+            Las ollas están en <Link href="/preparaciones" className="underline">Preparaciones</Link> y los ingredientes en <Link href={`/compras?semana=${week}`} className="underline">Compras</Link>.
+          </Notice>
+        </div>
+      ) : null}
 
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-1">

@@ -17,6 +17,9 @@
       ],
       "@nutriduo/catalog": [
         "./packages/catalog/src/index.ts"
+      ],
+      "@nutriduo/menu-engine": [
+        "./packages/menu-engine/src/index.ts"
       ]
     }
   },

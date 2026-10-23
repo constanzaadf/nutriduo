@@ -13,6 +13,7 @@ nutriduo/
 │   ├── nutrition-engine/         Metas: Mifflin-St Jeor / Katch-McArdle, TDEE sin doble conteo, pisos, pauta por intercambios
 │   ├── portion-engine/           Porciones: solver MILP propio (simplex + branch-and-bound), comidas compartidas, evaluación de recetas
 │   ├── shopping-engine/          Compras: consolidación, neteo contra inventario, formatos comerciales, diff que conserva lo marcado
+│   ├── menu-engine/              Menú semanal: ollas del domingo (refrigerado/congelado), comidas del día, metas de ambos
 │   └── catalog/                  Catálogo base: 94 ingredientes con datos USDA SR28 y 37 recetas validadas contra los motores
 ├── supabase/
 │   ├── migrations/               31 tablas, triggers de integridad, RLS por hogar y visibilidad, funciones transaccionales
@@ -40,10 +41,10 @@ Primer uso: cada persona crea su cuenta con correo y contraseña (también hay e
 ## Pruebas
 
 ```bash
-pnpm test                          # 303 pruebas: motores + catálogo (cada receta se resuelve para dos perfiles tipo)
+pnpm test                          # 327 pruebas: motores, catálogo y menú semanal
 pnpm typecheck                     # tipos de los motores y del catálogo
 pnpm catalog:generate              # regenera el SQL del catálogo (el CI exige que esté al día)
-DATABASE_URL=postgres://... ./supabase/tests/run.sh   # migraciones + 77 verificaciones SQL en una base desechable
+DATABASE_URL=postgres://... ./supabase/tests/run.sh   # migraciones + 87 verificaciones SQL en una base desechable
 ```
 
 | Criterio del prompt | Dónde se prueba |
@@ -68,12 +69,13 @@ DATABASE_URL=postgres://... ./supabase/tests/run.sh   # migraciones + 77 verific
 - **Crudo y cocido nunca se mezclan.** Las preparaciones homogéneas (guisos, salsas) se reparten en gramos de preparación terminada; pesar la olla vuelve exactas las porciones (sin peso, quedan rotuladas `≈`).
 - **Privacidad por fila.** Compartir cocina no implica compartir datos de salud. Visibilidad por persona: *nada*, *resumen* (gramos de la porción compartida) o *todo*. Las alergias sí se comparten con el hogar. El cálculo de una comida compartida lee la meta de la otra persona en el servidor (service role) solo después de verificar que ambos pertenecen al hogar, y al navegador vuelve lo que la visibilidad permite.
 - **Sin compensaciones.** Un desvío registrado no cambia las comidas siguientes.
+- **Menú semanal con cocina del domingo.** *Calendario → Proponer semana* arma la semana siguiente: 2 a 4 ollas homogéneas (guisos, legumbres, salsas) cocinadas el domingo cubren almuerzos (y, si se elige, cenas) de lunes a viernes, rotando para no repetir plato en comidas seguidas y sin repetir proteína entre ollas. Lo que se come más de 3 días después de cocinar se congela ese domingo (la comida cocida dura 3 a 4 días refrigerada). El fin de semana y los desayunos se cocinan en el día, con tope de tiempo (10 min desayunos y 25 min el resto en semana; 90 min el fin de semana). Cada olla se dimensiona sumando las porciones calculadas para cada persona más un 8 % de margen. Si una alergia afecta solo a un acompañamiento, esa persona lo omite en vez de descartar la receta. Es determinista: *Otra propuesta* cambia la semilla. Aplicar crea lotes y comidas en una transacción y aprueba las porciones, así todo entra a la lista de compras (que toma las ollas del domingo anterior).
 
 ## Estado
 
-**Verificado:** los motores y el catálogo (303 pruebas y tipos estrictos), la base de datos (migraciones aplicadas sobre Postgres 16 con un dueño sin privilegios especiales, como en Supabase, y 77 verificaciones de integridad, RLS y catálogo) y el build de la app en CI.
+**Verificado:** los motores, el catálogo y el menú semanal (327 pruebas y tipos estrictos), la base de datos (migraciones aplicadas sobre Postgres 16 con un dueño sin privilegios especiales, como en Supabase, y 87 verificaciones de integridad, RLS, catálogo y menú) y el build de la app en CI. Las dependencias quedan fijas en `pnpm-lock.yaml`: CI y Vercel instalan con `--frozen-lockfile`. Si cambia un `package.json`, el workflow *Lockfile* regenera y commitea el lockfile.
 
-**Pendiente (fase 2 del diseño):** importar recetas y pautas desde URL, imagen o PDF; "hacer fit" con IA y modo conjunto del motor (optimizar la olla para ambos); generador automático de menú semanal; asistente conversacional; arrastrar y soltar en el calendario (hoy se mueve desde el detalle de la comida); alertas de vencimiento.
+**Pendiente (fase 2 del diseño):** importar recetas y pautas desde URL, imagen o PDF; "hacer fit" con IA y modo conjunto del motor (optimizar la olla para ambos); asistente conversacional; arrastrar y soltar en el calendario (hoy se mueve desde el detalle de la comida); alertas de vencimiento.
 
 ## Fuentes nutricionales
 

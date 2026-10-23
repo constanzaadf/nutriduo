@@ -14,7 +14,7 @@ import {
   type ShoppingLine,
 } from "@nutriduo/shopping-engine";
 import { loadIngredients } from "../data/catalog";
-import { weekDays } from "../dates";
+import { addDays, weekDays } from "../dates";
 import type { ServerClient } from "../supabase/server";
 import { num, type BatchRow, type ShoppingItemRow } from "../types";
 
@@ -75,14 +75,15 @@ export async function computeWeekShopping(db: ServerClient, householdId: string,
     }
   }
 
-  // Lotes planificados para cocinar esta semana: sus crudos entran una vez
+  // Lotes planificados que alimentan esta semana: se cocinan desde el domingo anterior
+  // hasta el sábado (lo del domingo de esta semana es para la siguiente). Sus crudos entran una vez.
   const { data: batches } = await db
     .from("cooking_batches")
     .select("*")
     .eq("household_id", householdId)
     .eq("status", "planned")
-    .gte("planned_for", days[0]!)
-    .lte("planned_for", days[6]!);
+    .gte("planned_for", addDays(days[0]!, -1))
+    .lte("planned_for", addDays(days[6]!, -1));
   for (const b of (batches ?? []) as BatchRow[]) {
     demands.push(...demandsFromBatch(b.id, b.planned_for!, b.raw_input.map((l) => ({ ingredientId: l.ingredientId, grams: num(l.grams), state: l.state }))));
   }

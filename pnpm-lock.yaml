@@ -23,6 +23,9 @@ importers:
       '@nutriduo/domain':
         specifier: workspace:*
         version: link:../../packages/domain
+      '@nutriduo/menu-engine':
+        specifier: workspace:*
+        version: link:../../packages/menu-engine
       '@nutriduo/nutrition-engine':
         specifier: workspace:*
         version: link:../../packages/nutrition-engine
@@ -89,6 +92,22 @@ importers:
         version: link:../portion-engine
 
   packages/domain: {}
+
+  packages/menu-engine:
+    dependencies:
+      '@nutriduo/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@nutriduo/nutrition-engine':
+        specifier: workspace:*
+        version: link:../nutrition-engine
+      '@nutriduo/portion-engine':
+        specifier: workspace:*
+        version: link:../portion-engine
+    devDependencies:
+      '@nutriduo/catalog':
+        specifier: workspace:*
+        version: link:../catalog
 
   packages/nutrition-engine:
     dependencies:
