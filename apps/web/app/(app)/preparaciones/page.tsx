@@ -23,7 +23,7 @@ async function planBatch(fd: FormData) {
   const { data: r } = await ctx.supabase.from("recipes").select("current_version_id").eq("id", d.data.recipe_id).single();
   if (!r?.current_version_id) return;
   const { version } = await loadRecipeVersion(ctx.supabase, r.current_version_id);
-  const ingredients = await loadIngredients(ctx.supabase, version.lines.map((l) => l.ingredientId));
+  const ingredients = await loadIngredients(ctx.supabase, version.lines.map((l) => l.ingredientId), ctx.household.id);
   // La olla: líneas que no son acompañamiento, escaladas a las porciones pedidas
   const mix = nominalMix(version, ingredients);
   const scale = d.data.servings / version.servingsNominal;

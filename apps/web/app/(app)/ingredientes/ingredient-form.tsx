@@ -4,18 +4,10 @@ import { useActionState } from "react";
 import { Submit } from "@/components/submit";
 import { Notice } from "@/components/ui";
 import { createIngredient, type IngredientState } from "./actions";
+import { EXCHANGE_GROUPS, INGREDIENT_CATEGORIES } from "@/lib/data/labels";
 
-const CATEGORIES = [
-  ["carnes", "Carnes"], ["pescados", "Pescados"], ["huevos", "Huevos"], ["lacteos", "Lácteos"], ["cereales", "Cereales y pastas"],
-  ["legumbres", "Legumbres"], ["verduras", "Verduras"], ["frutas", "Frutas"], ["grasas", "Aceites y grasas"], ["frutos_secos", "Frutos secos"],
-  ["condimentos", "Condimentos"], ["panaderia", "Panadería"], ["bebidas", "Bebidas"], ["otros", "Otros"],
-];
-const GROUPS = [
-  ["cereales", "Cereales"], ["verduras_general", "Verduras consumo general"], ["verduras_libre", "Verduras libre consumo"], ["frutas", "Frutas"],
-  ["carnes_altas_grasa", "Carnes altas en grasa"], ["carnes_bajas_grasa", "Carnes bajas en grasa"], ["legumbres", "Leguminosas"],
-  ["lacteos_altos_grasa", "Lácteos altos en grasa"], ["lacteos_medios_grasa", "Lácteos medios en grasa"], ["lacteos_bajos_grasa", "Lácteos bajos en grasa"],
-  ["aceites_grasas", "Aceites y grasas"], ["alimentos_ricos_lipidos", "Ricos en lípidos"], ["azucares", "Azúcares"],
-];
+const CATEGORIES = INGREDIENT_CATEGORIES;
+const GROUPS = EXCHANGE_GROUPS;
 
 export function IngredientForm() {
   const [state, action] = useActionState<IngredientState, FormData>(createIngredient, null);

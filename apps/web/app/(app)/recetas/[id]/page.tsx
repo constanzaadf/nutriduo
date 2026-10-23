@@ -35,7 +35,7 @@ export default async function RecipePage({ params, searchParams }: { params: Pro
   const versionId = sp.v ?? recipe.current_version_id ?? versions[0]?.id;
   if (!versionId) notFound();
   const { version, row, lines } = await loadRecipeVersion(ctx.supabase, versionId);
-  const ingredients = await loadIngredients(ctx.supabase, version.lines.map((l) => l.ingredientId));
+  const ingredients = await loadIngredients(ctx.supabase, version.lines.map((l) => l.ingredientId), ctx.household.id);
   const serving = nominalServing(version, ingredients);
 
   // Evaluación individual: cada perfil con su propio presupuesto para el tiempo de comida típico
@@ -53,7 +53,12 @@ export default async function RecipePage({ params, searchParams }: { params: Pro
     <>
       <PageHeader
         title={recipe.name}
-        lead={`${CATEGORY_LABEL[recipe.category]}, rinde ${num(row.servings_nominal)} porciones${recipe.prep_minutes ? `, ${recipe.prep_minutes} min` : ""}${row.is_homogeneous ? ", se reparte como preparación terminada" : ""}.`}
+        lead={
+          <>
+            {`${CATEGORY_LABEL[recipe.category]}, rinde ${num(row.servings_nominal)} porciones${recipe.prep_minutes ? `, ${recipe.prep_minutes} min` : ""}${row.is_homogeneous ? ", se reparte como preparación terminada" : ""}.`}
+            {recipe.catalog_slug ? <span className="ml-2 align-middle"><Tag>Recetario base</Tag></span> : null}
+          </>
+        }
         actions={
           <>
             <form action={toggleFavorite}>

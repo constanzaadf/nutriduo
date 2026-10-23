@@ -12,17 +12,20 @@ nutriduo/
 │   ├── domain/                   Nutrientes, unidades, estados crudo/cocido, procedencia de cada cifra
 │   ├── nutrition-engine/         Metas: Mifflin-St Jeor / Katch-McArdle, TDEE sin doble conteo, pisos, pauta por intercambios
 │   ├── portion-engine/           Porciones: solver MILP propio (simplex + branch-and-bound), comidas compartidas, evaluación de recetas
-│   └── shopping-engine/          Compras: consolidación, neteo contra inventario, formatos comerciales, diff que conserva lo marcado
+│   ├── shopping-engine/          Compras: consolidación, neteo contra inventario, formatos comerciales, diff que conserva lo marcado
+│   └── catalog/                  Catálogo base: 94 ingredientes con datos USDA SR28 y 37 recetas validadas contra los motores
 ├── supabase/
 │   ├── migrations/               31 tablas, triggers de integridad, RLS por hogar y visibilidad, funciones transaccionales
-│   ├── seed.sql                  Tabla de intercambios por defecto (rotulada como estimada; sin recetas inventadas)
+│   ├── seed.sql                  Tabla de intercambios por defecto (rotulada como estimada)
+│   ├── setup_completo.sql        Todo lo anterior en un archivo, para un proyecto nuevo (generado)
+│   ├── catalogo_recetario.sql    Actualización para proyectos que ya tenían 001–005 (generado; se puede correr dos veces)
 │   └── tests/                    Pruebas SQL de integridad y privacidad (corren contra cualquier Postgres 16)
 └── apps/web/                     Next.js 15 (App Router), React 19, Tailwind 4, Supabase Auth
 ```
 
 ## Puesta en marcha
 
-1. **Supabase.** Crea un proyecto. En *SQL Editor* ejecuta, en orden, los archivos de `supabase/migrations/` y luego `supabase/seed.sql` (o usa `supabase link` + `supabase db push`). En *Authentication → URL Configuration* agrega tu URL y `https://TU-URL/auth/callback` como redirect.
+1. **Supabase.** Crea un proyecto. En *SQL Editor* pega y ejecuta `supabase/setup_completo.sql` (o usa `supabase link` + `supabase db push` y luego `supabase/seed.sql`). Si ya habías instalado una versión anterior, ejecuta solo `supabase/catalogo_recetario.sql`. En *Authentication → URL Configuration* agrega tu URL y `https://TU-URL/auth/callback` como redirect.
 2. **Variables.** Copia `apps/web/.env.example` a `apps/web/.env.local` y completa con *Project Settings → API*. La `SUPABASE_SERVICE_ROLE_KEY` es solo de servidor.
 3. **Instalar y correr.**
    ```bash
@@ -32,14 +35,15 @@ nutriduo/
    ```
 4. **Desplegar.** En Vercel, importa el repo con *Root Directory* `apps/web` y las mismas variables de entorno.
 
-Primer uso: cada persona crea su cuenta con correo y contraseña (también hay enlace por correo como alternativa). Una persona crea el hogar y comparte el código de 8 caracteres; la otra se une. Cada uno completa su perfil y guarda una meta (calculada, indicada por un profesional o como pauta por porciones). Después: ingredientes → recetas → calendario.
+Primer uso: cada persona crea su cuenta con correo y contraseña (también hay enlace por correo como alternativa). Una persona crea el hogar y comparte el código de 8 caracteres; la otra se une. Cada uno completa su perfil y guarda una meta (calculada, indicada por un profesional o como pauta por porciones). El hogar parte con el recetario base cargado (37 recetas) y los ingredientes del catálogo; después: calendario. Recetas e ingredientes propios se agregan igual que siempre.
 
 ## Pruebas
 
 ```bash
-pnpm test                          # 109 pruebas de los motores (node:test)
-pnpm typecheck                     # tipos de los motores
-DATABASE_URL=postgres://... ./supabase/tests/run.sh   # migraciones + 59 verificaciones SQL en una base desechable
+pnpm test                          # 303 pruebas: motores + catálogo (cada receta se resuelve para dos perfiles tipo)
+pnpm typecheck                     # tipos de los motores y del catálogo
+pnpm catalog:generate              # regenera el SQL del catálogo (el CI exige que esté al día)
+DATABASE_URL=postgres://... ./supabase/tests/run.sh   # migraciones + 77 verificaciones SQL en una base desechable
 ```
 
 | Criterio del prompt | Dónde se prueba |
@@ -67,14 +71,21 @@ DATABASE_URL=postgres://... ./supabase/tests/run.sh   # migraciones + 59 verific
 
 ## Estado
 
-**Verificado en el entorno de desarrollo:** los motores (109 pruebas y tipos estrictos) y la base de datos (migraciones aplicadas sobre Postgres 16 y 59 verificaciones de integridad y RLS).
-
-**Escrito pero no compilado todavía:** la app web. El entorno donde se construyó no tenía acceso al registro de npm, así que se verificó con tipos sustitutos para Next/Supabase/React. El primer `pnpm install && pnpm build` puede mostrar ajustes menores de tipos; el CI (`.github/workflows/ci.yml`) los detecta.
+**Verificado:** los motores y el catálogo (303 pruebas y tipos estrictos), la base de datos (migraciones aplicadas sobre Postgres 16 con un dueño sin privilegios especiales, como en Supabase, y 77 verificaciones de integridad, RLS y catálogo) y el build de la app en CI.
 
 **Pendiente (fase 2 del diseño):** importar recetas y pautas desde URL, imagen o PDF; "hacer fit" con IA y modo conjunto del motor (optimizar la olla para ambos); generador automático de menú semanal; asistente conversacional; arrastrar y soltar en el calendario (hoy se mueve desde el detalle de la comida); alertas de vencimiento.
 
 ## Fuentes nutricionales
 
 Cada valor guarda su fuente (`label` = etiqueta del envase, `fdc` = USDA FoodData Central, `manual` = estimado) y su nivel de confianza. La tabla de intercambios por defecto es una referencia de uso habitual en Chile, marcada como estimada: si tienes una pauta, sus valores mandan.
+
+**Catálogo base.** Los valores por 100 g vienen de USDA National Nutrient Database for Standard Reference, Release 28 (SR28, dominio público; mismos datos que *SR Legacy* en FoodData Central). Se extrajeron de `ABBREV.txt` con `packages/catalog/scripts/extract-sr28.ts`; el extracto guarda la huella sha256 del archivo y cada fila cita su código NDB y la descripción original en inglés. Además:
+
+- **Rendimiento crudo → cocido**, derivado de los mismos datos: balance de materia seca para cereales, legumbres y tubérculos; conservación de proteína para carnes.
+- **Gramos por porción de intercambio**, derivados del nutriente que define cada grupo (carbohidratos en cereales, frutas, verduras, legumbres y azúcares; proteína en carnes; energía en lácteos; grasa en aceites). Son estimaciones: si la pauta de tu nutricionista dice otra cosa, ajústalo en *Ingredientes* y vale solo para tu hogar.
+- **Pesos por unidad** (huevo, pan, tortilla, plátano) tomados de las medidas caseras de SR28.
+- Productos de marca (proteína en polvo, quesillo, panes específicos) conviene cargarlos con su etiqueta: el valor genérico es una aproximación.
+
+Las 37 recetas son preparaciones caseras de uso común, sin pescados, mariscos, cerdo, pavo ni quinoa. Cada una se prueba contra los motores: datos completos, porción factible para un perfil de pérdida de grasa y uno de ganancia muscular, y funcionamiento en modo pauta por porciones.
 
 La app apoya la planificación; no reemplaza la atención nutricional. Con embarazo, lactancia o una condición médica declarada, no aplica déficit ni superávit automático.

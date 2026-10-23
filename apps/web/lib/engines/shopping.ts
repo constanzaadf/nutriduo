@@ -106,7 +106,7 @@ export async function computeWeekShopping(db: ServerClient, householdId: string,
   const { data: packs } = await db.from("pack_sizes").select("ingredient_id, grams, label, price").eq("household_id", householdId);
   const packSizes: PackSize[] = (packs ?? []).map((p) => ({ ingredientId: p.ingredient_id as string, grams: num(p.grams), label: p.label as string, price: p.price == null ? null : num(p.price) }));
 
-  const ingredients = await loadIngredients(db, demands.map((d) => d.ingredientId));
+  const ingredients = await loadIngredients(db, demands.map((d) => d.ingredientId), householdId);
   const next = buildShoppingList({ demands, ingredients, inventory, packSizes });
 
   const { data: existingRows } = await db.from("shopping_list_items").select("*").eq("list_id", listId).order("position");

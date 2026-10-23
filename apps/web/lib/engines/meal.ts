@@ -53,7 +53,7 @@ export async function computeMeal(
   // 2. Receta e ingredientes (incluidos los extras de cada participante)
   const { version } = await loadRecipeVersion(admin, event.recipe_version_id);
   const extraIds = participants.flatMap((p) => (p.options?.extras ?? []).map((e) => e.ingredient_id));
-  const ingredients = await loadIngredients(admin, [...version.lines.map((l) => l.ingredientId), ...extraIds]);
+  const ingredients = await loadIngredients(admin, [...version.lines.map((l) => l.ingredientId), ...extraIds], event.household_id);
 
   // 3. Lote de origen, si lo hay
   let batch: { mix: MixInfo; availableG: number } | undefined;

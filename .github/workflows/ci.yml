@@ -21,6 +21,8 @@ jobs:
         run: pnpm test
       - name: Tipos de los motores
         run: pnpm typecheck
+      - name: SQL del catálogo al día con sus fuentes
+        run: pnpm catalog:generate && git diff --exit-code -- supabase
       - name: Tipos y build de la app
         run: pnpm --filter @nutriduo/web typecheck && pnpm build
         env:

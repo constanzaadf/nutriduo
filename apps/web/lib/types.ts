@@ -78,6 +78,7 @@ export interface IngredientRow {
   exchange_grams: number | null;
   exchange_state: "raw" | "cooked" | "as_sold" | null;
   allergen_tags: string[];
+  catalog_slug?: string | null;
 }
 
 export interface NutritionRowDb {
@@ -105,6 +106,8 @@ export interface RecipeRow {
   favorite: boolean;
   archived: boolean;
   current_version_id: string | null;
+  /** Receta importada del recetario base (null si es propia). */
+  catalog_slug: string | null;
 }
 
 export interface RecipeVersionRow {

@@ -13,7 +13,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "pnpm --filter @nutriduo/web dev",
     "build": "pnpm --filter @nutriduo/web build",
-    "db:test": "supabase test db"
+    "db:test": "supabase test db",
+    "catalog:generate": "node --import tsx packages/catalog/scripts/generate-sql.ts",
+    "catalog:report": "node --import tsx packages/catalog/scripts/report.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

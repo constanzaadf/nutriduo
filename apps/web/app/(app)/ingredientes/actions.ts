@@ -118,3 +118,43 @@ export async function deleteIngredient(fd: FormData) {
   await ctx.supabase.from("ingredients").delete().eq("id", String(fd.get("id"))).eq("household_id", ctx.household.id);
   revalidatePath("/ingredientes");
 }
+
+/** Ajusta (o quita) la porción de intercambio de un ingrediente para este hogar. */
+export async function setExchangeOverride(fd: FormData) {
+  const ctx = await requireContext();
+  const schema = z.object({
+    ingredient_id: z.string().uuid(),
+    mode: z.enum(["set", "none", "reset"]),
+    exchange_group_code: z.string().max(60).nullable(),
+    exchange_grams: n(0.1, 2000),
+    note: z.string().trim().max(200).nullable(),
+  });
+  const get = (k: string) => {
+    const v = fd.get(k);
+    return v === null || String(v).trim() === "" ? null : String(v);
+  };
+  const d = schema.safeParse({
+    ingredient_id: fd.get("ingredient_id"),
+    mode: fd.get("mode"),
+    exchange_group_code: get("exchange_group_code"),
+    exchange_grams: fd.get("exchange_grams"),
+    note: get("note"),
+  });
+  if (!d.success) throw new Error("Datos inválidos para el ajuste de intercambio.");
+  const { ingredient_id, mode, exchange_group_code, exchange_grams, note } = d.data;
+  if (mode === "reset") {
+    await ctx.supabase.from("household_ingredient_overrides").delete().eq("household_id", ctx.household.id).eq("ingredient_id", ingredient_id);
+  } else {
+    if (mode === "set" && (!exchange_group_code || exchange_grams == null)) throw new Error("Indica el grupo y los gramos de una porción.");
+    const { error } = await ctx.supabase.from("household_ingredient_overrides").upsert({
+      household_id: ctx.household.id,
+      ingredient_id,
+      exchange_group_code: mode === "set" ? exchange_group_code : null,
+      exchange_grams: mode === "set" ? exchange_grams : null,
+      note,
+      updated_at: new Date().toISOString(),
+    });
+    if (error) throw new Error(error.message);
+  }
+  revalidatePath("/ingredientes");
+}

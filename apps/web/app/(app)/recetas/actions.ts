@@ -108,3 +108,11 @@ export async function archiveRecipe(fd: FormData) {
   revalidatePath("/recetas");
   redirect("/recetas");
 }
+
+/** Agrega al hogar las recetas del recetario base que le falten (no duplica). */
+export async function importCatalogRecipes() {
+  const ctx = await requireContext();
+  const { error } = await ctx.supabase.rpc("import_catalog_recipes", { p_household: ctx.household.id });
+  if (error) throw new Error(`No se pudo importar el recetario: ${error.message}`);
+  revalidatePath("/recetas");
+}

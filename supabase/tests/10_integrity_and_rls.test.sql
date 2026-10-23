@@ -56,7 +56,7 @@ insert into public.ingredients (id, household_id, name, category, default_state,
   ('22222222-0000-0000-0000-000000000001', (select v::uuid from ctx where k = 'hid'), 'Pollo', 'carnes', 'raw', '{}'),
   ('22222222-0000-0000-0000-000000000002', (select v::uuid from ctx where k = 'hid'), 'Maní tostado', 'frutos_secos', 'as_sold', '{mani}'),
   ('22222222-0000-0000-0000-000000000003', (select v::uuid from ctx where k = 'hid'), 'Aceite', 'grasas', 'as_sold', '{}');
-select tests.ok((select count(*) from public.ingredients) = 4, 'A ve el catálogo global más los ingredientes de su hogar');
+select tests.ok((select count(*) from public.ingredients where household_id is not null) = 3 and (select count(*) from public.ingredients where household_id is null) > 90, 'A ve el catálogo global más los ingredientes de su hogar');
 select tests.throws($$insert into public.ingredients (household_id, name) values (null, 'Hackeo global')$$, '42501', 'nadie escribe en el catálogo global');
 
 insert into ctx values ('r1', public.create_recipe(
@@ -256,11 +256,11 @@ select tests.throws($$update public.calculation_runs set engine_version = 'x'$$,
 -- ───────────── Aislamiento entre hogares ─────────────
 select tests.login('cccccccc-0000-0000-0000-000000000003');
 set role authenticated;
-select tests.ok((select count(*) from public.recipes) = 0, 'otro hogar no ve recetas ajenas');
+select tests.ok((select count(*) from public.recipes where household_id <> (select v::uuid from ctx where k = 'hidC')) = 0, 'otro hogar no ve recetas ajenas');
 select tests.ok((select count(*) from public.meal_events) = 0, 'ni el calendario');
 select tests.ok((select count(*) from public.shopping_list_items) = 0, 'ni la lista de compras');
 select tests.ok((select count(*) from public.dietary_restrictions) = 0, 'ni las alergias');
-select tests.ok((select count(*) from public.ingredients) = 1, 'solo el catálogo global');
+select tests.ok((select count(*) from public.ingredients where household_id is not null) = 0, 'solo el catálogo global');
 select tests.throws($$insert into public.recipes (household_id, name) values ('$$ || (select v from ctx where k = 'hid') || $$', 'intrusa')$$, '42501', 'ni puede escribir en él');
 reset role;
 

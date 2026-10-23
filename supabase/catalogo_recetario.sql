@@ -1,0 +1,593 @@
+-- NutriDuo: actualización con catálogo de ingredientes y recetario base.
+-- Para un proyecto que YA tiene instalado setup_completo.sql. Pegar entero en
+-- Supabase → SQL Editor → Run. Se puede ejecutar más de una vez sin duplicar nada.
+
+-- ════════════════════════════════════════════════════════════════════════
+-- NutriDuo · 006 · Catálogo base (ingredientes y recetario) + ajustes
+--
+-- 1. Las tablas dejan de FORZAR RLS para su dueño. Las políticas siguen
+--    aplicando a todo el tráfico de la app (roles anon/authenticated); el
+--    cambio solo permite que las funciones SECURITY DEFINER funcionen aunque
+--    el dueño no tenga BYPASSRLS.
+-- 2. Ingredientes globales con identificador estable (catalog_slug).
+-- 3. Recetario base: plantillas de solo lectura que cada hogar importa como
+--    recetas propias (versionables y optimizables como cualquier otra).
+-- 4. Ajustes por hogar de la porción de intercambio de cualquier ingrediente,
+--    para calzar con la pauta de cada nutricionista.
+-- ════════════════════════════════════════════════════════════════════════
+
+-- ───────────── 1. RLS sin FORCE ─────────────
+do $$
+declare t text;
+begin
+  for t in select tablename from pg_tables where schemaname = 'public' loop
+    execute format('alter table public.%I no force row level security', t);
+  end loop;
+end $$;
+
+-- ───────────── 2. Ingredientes del catálogo ─────────────
+alter table public.ingredients add column if not exists catalog_slug text;
+create unique index if not exists ingredients_catalog_slug on public.ingredients (catalog_slug) where catalog_slug is not null;
+alter table public.ingredients drop constraint if exists ingredients_catalog_is_global;
+alter table public.ingredients add constraint ingredients_catalog_is_global check (catalog_slug is null or household_id is null);
+
+-- ───────────── 3. Recetario base ─────────────
+create table if not exists public.recipe_catalog (
+  slug text primary key check (slug ~ '^[a-z0-9-]+$'),
+  name text not null,
+  category text not null check (category in ('desayunos', 'almuerzos', 'cenas', 'snacks', 'postres', 'preparaciones_base')),
+  tags text[] not null default '{}',
+  prep_minutes int check (prep_minutes between 0 and 1440),
+  servings_nominal numeric(5, 2) not null check (servings_nominal > 0),
+  is_homogeneous boolean not null default false,
+  expected_cooked_yield_g numeric(8, 1) check (expected_cooked_yield_g > 0),
+  instructions text not null,
+  -- [{ingredient: <catalog_slug>, grams, state, role, min_g?, max_g?, ratio_group?, integer_unit_g?, note?}]
+  lines jsonb not null check (jsonb_typeof(lines) = 'array' and jsonb_array_length(lines) > 0),
+  catalog_version int not null default 1,
+  updated_at timestamptz not null default now()
+);
+alter table public.recipe_catalog enable row level security;
+drop policy if exists recipe_catalog_read on public.recipe_catalog;
+create policy recipe_catalog_read on public.recipe_catalog for select to authenticated using (true);
+grant select on public.recipe_catalog to authenticated;
+
+alter table public.recipes add column if not exists catalog_slug text references public.recipe_catalog (slug) on delete set null;
+create unique index if not exists recipes_household_catalog on public.recipes (household_id, catalog_slug) where catalog_slug is not null;
+
+-- ───────────── 4. Ajustes de intercambio por hogar ─────────────
+create table if not exists public.household_ingredient_overrides (
+  household_id uuid not null references public.households (id) on delete cascade,
+  ingredient_id uuid not null references public.ingredients (id) on delete cascade,
+  exchange_group_code text,
+  exchange_grams numeric(7, 2) check (exchange_grams > 0),
+  note text,
+  updated_at timestamptz not null default now(),
+  primary key (household_id, ingredient_id),
+  check ((exchange_group_code is null) = (exchange_grams is null))
+);
+alter table public.household_ingredient_overrides enable row level security;
+drop policy if exists overrides_household on public.household_ingredient_overrides;
+create policy overrides_household on public.household_ingredient_overrides for all to authenticated
+  using (public.is_member(household_id)) with check (public.is_member(household_id));
+grant select, insert, update, delete on public.household_ingredient_overrides to authenticated;
+
+-- ───────────── Importación del recetario a un hogar ─────────────
+
+-- Interna (sin verificación de sesión): la usan create_household y la migración.
+create or replace function public._import_catalog_recipes(p_household uuid)
+returns int language plpgsql security definer set search_path = public as $$
+declare
+  c public.recipe_catalog%rowtype;
+  v_recipe uuid;
+  v_version uuid;
+  v_line jsonb;
+  v_ing uuid;
+  v_pos int;
+  v_count int := 0;
+begin
+  for c in select * from public.recipe_catalog order by category, name loop
+    if exists (select 1 from public.recipes where household_id = p_household and catalog_slug = c.slug) then
+      continue;
+    end if;
+    insert into public.recipes (household_id, name, category, tags, prep_minutes, catalog_slug)
+      values (p_household, c.name, c.category, c.tags, c.prep_minutes, c.slug)
+      returning id into v_recipe;
+    insert into public.recipe_versions (recipe_id, version_no, origin, name, servings_nominal, is_homogeneous,
+                                        expected_cooked_yield_g, instructions, change_log)
+      values (v_recipe, 1, 'original', c.name, c.servings_nominal, c.is_homogeneous, c.expected_cooked_yield_g,
+              c.instructions, '[]'::jsonb)
+      returning id into v_version;
+    v_pos := 0;
+    for v_line in select * from jsonb_array_elements(c.lines) loop
+      v_pos := v_pos + 1;
+      select id into v_ing from public.ingredients where catalog_slug = v_line ->> 'ingredient';
+      if v_ing is null then
+        raise exception 'Receta "%": ingrediente de catálogo inexistente "%"', c.slug, v_line ->> 'ingredient';
+      end if;
+      insert into public.recipe_ingredients (version_id, position, ingredient_id, grams, state, role, min_g, max_g, ratio_group, integer_unit_g, note)
+        values (v_version, v_pos, v_ing, (v_line ->> 'grams')::numeric, v_line ->> 'state', coalesce(v_line ->> 'role', 'adjustable'),
+                nullif(v_line ->> 'min_g', '')::numeric, nullif(v_line ->> 'max_g', '')::numeric, v_line ->> 'ratio_group',
+                nullif(v_line ->> 'integer_unit_g', '')::numeric, v_line ->> 'note');
+    end loop;
+    update public.recipe_versions set sealed_at = now() where id = v_version;
+    update public.recipes set current_version_id = v_version where id = v_recipe;
+    v_count := v_count + 1;
+  end loop;
+  return v_count;
+end $$;
+revoke execute on function public._import_catalog_recipes(uuid) from public, anon, authenticated;
+
+-- Pública: un integrante agrega al hogar las recetas del catálogo que le falten.
+create or replace function public.import_catalog_recipes(p_household uuid)
+returns int language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_member(p_household) then
+    raise exception 'Sin acceso a ese hogar' using errcode = '42501';
+  end if;
+  return public._import_catalog_recipes(p_household);
+end $$;
+grant execute on function public.import_catalog_recipes(uuid) to authenticated;
+
+-- Un hogar nuevo parte con el recetario base cargado.
+create or replace function public.create_household(p_name text, p_display_name text)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid := auth.uid();
+  v_household uuid;
+  v_profile uuid;
+begin
+  if v_uid is null then
+    raise exception 'Sesión requerida' using errcode = '28000';
+  end if;
+  insert into public.users (id, display_name) values (v_uid, p_display_name)
+    on conflict (id) do update set display_name = excluded.display_name;
+  insert into public.households (name, created_by, invite_code)
+    values (p_name, v_uid, public.new_invite_code()) returning id into v_household;
+  insert into public.nutrition_profiles (household_id, user_id, display_name)
+    values (v_household, v_uid, p_display_name) returning id into v_profile;
+  insert into public.household_members (household_id, user_id, role, profile_id)
+    values (v_household, v_uid, 'owner', v_profile);
+  perform public._import_catalog_recipes(v_household);
+  return v_household;
+end $$;
+
+-- Tabla de intercambios por defecto (por si no se cargó en la instalación; no duplica)
+-- ════════════════════════════════════════════════════════════════════════
+-- NutriDuo · Datos iniciales
+-- Tabla de intercambios por defecto: valores de uso habitual en pautas
+-- chilenas, marcados como ESTIMADOS. Cada hogar puede reemplazarlos por los
+-- de su propia pauta (exchange_groups con household_id).
+-- No se cargan recetas ni ingredientes ficticios.
+-- ════════════════════════════════════════════════════════════════════════
+
+insert into public.exchange_groups (household_id, code, label, kcal, protein_g, carbs_g, fat_g, reference, confidence) values
+  (null, 'cereales',                'Cereales, papas y legumbres frescas', 140, 3,  30,  1,  'Valores de uso habitual; verificar con la pauta', 'estimated'),
+  (null, 'verduras_general',        'Verduras de consumo general',          30, 2,   5,  0,  'Valores de uso habitual; verificar con la pauta', 'estimated'),
+  (null, 'verduras_libre',          'Verduras de libre consumo',            10, 1, 2.5,  0,  'Valores de uso habitual; verificar con la pauta', 'estimated'),
+  (null, 'frutas',                  'Frutas',                               65, 1,  15,  0,  'Valores de uso habitual; verificar con la pauta', 'estimated'),
+  (null, 'carnes_altas_grasa',      'Carnes altas en grasa',               120, 11,  1,  8,  'Valores de uso habitual; verificar con la pauta', 'estimated'),
+  (null, 'carnes_bajas_grasa',      'Carnes bajas en grasa',                65, 11,  1,  2,  'Valores de uso habitual; verificar con la pauta', 'estimated'),
+  (null, 'legumbres',               'Leguminosas',                         170, 11, 30,  1,  'Valores de uso habitual; verificar con la pauta', 'estimated'),
+  (null, 'lacteos_altos_grasa',     'Lácteos altos en grasa',              110, 5,   9,  6,  'Valores de uso habitual; verificar con la pauta', 'estimated'),
+  (null, 'lacteos_medios_grasa',    'Lácteos medios en grasa',              85, 5,   9,  3,  'Valores de uso habitual; verificar con la pauta', 'estimated'),
+  (null, 'lacteos_bajos_grasa',     'Lácteos bajos en grasa',               70, 7,  10,  0,  'Valores de uso habitual; verificar con la pauta', 'estimated'),
+  (null, 'aceites_grasas',          'Aceites y grasas',                    180, 0,   0, 20,  'Valores de uso habitual; verificar con la pauta', 'estimated'),
+  (null, 'alimentos_ricos_lipidos', 'Alimentos ricos en lípidos',          175, 3,   5, 15,  'Valores de uso habitual; verificar con la pauta', 'estimated'),
+  (null, 'azucares',                'Azúcares',                             20, 0,   5,  0,  'Valores de uso habitual; verificar con la pauta', 'estimated')
+on conflict do nothing;
+
+-- ════════════════════════════════════════════════════════════════════════
+-- NutriDuo · 007 · Datos del catálogo base (GENERADO: no editar a mano)
+-- Generado por packages/catalog/scripts/generate-sql.ts
+-- Fuente nutricional: USDA National Nutrient Database for Standard Reference, Release 28 (SR28), archivo abreviado ABBREV.txt
+-- Huella del archivo fuente (sha256): 4c42235a001efd5e94ce38001682138056aa1b755427b8a8d315c2b02cd2b85b
+-- 94 ingredientes · 37 recetas
+-- ════════════════════════════════════════════════════════════════════════
+
+-- Si ya existía un ingrediente global con el mismo nombre (cargado a mano), se adopta
+update public.ingredients i set catalog_slug = v.slug
+from (values
+  ('pechuga-pollo', 'Pechuga de pollo sin piel'),
+  ('trutro-pollo', 'Trutro de pollo deshuesado sin piel'),
+  ('carne-molida-5', 'Carne molida 5 % grasa'),
+  ('carne-molida-10', 'Carne molida 10 % grasa'),
+  ('posta-negra', 'Posta negra (vacuno magro)'),
+  ('carne-guisar', 'Carne magra para guisar (sobrecostilla)'),
+  ('huevo', 'Huevo'),
+  ('clara-huevo', 'Clara de huevo'),
+  ('proteina-whey', 'Proteína de suero en polvo (whey)'),
+  ('leche-descremada', 'Leche descremada'),
+  ('leche-semidescremada', 'Leche semidescremada'),
+  ('yogur-natural', 'Yogur natural descremado'),
+  ('yogur-griego', 'Yogur griego natural descremado'),
+  ('queso-cottage', 'Queso cottage 1 %'),
+  ('ricotta', 'Ricotta semidescremada'),
+  ('queso-gauda', 'Queso gauda / mantecoso'),
+  ('queso-parmesano', 'Queso parmesano rallado'),
+  ('queso-mozzarella', 'Queso mozzarella semidescremado'),
+  ('mantequilla', 'Mantequilla sin sal'),
+  ('avena', 'Avena en hojuelas'),
+  ('arroz', 'Arroz blanco grano largo'),
+  ('arroz-integral', 'Arroz integral'),
+  ('fideos', 'Fideos / pasta seca'),
+  ('fideos-integrales', 'Fideos integrales'),
+  ('cuscus', 'Cuscús'),
+  ('harina', 'Harina de trigo'),
+  ('pan-integral', 'Pan integral de molde'),
+  ('pan-frances', 'Pan blanco tipo marraqueta'),
+  ('pan-hamburguesa', 'Pan de hamburguesa'),
+  ('tortilla-harina', 'Tortilla de harina (wrap)'),
+  ('papa', 'Papa'),
+  ('camote', 'Camote'),
+  ('choclo', 'Choclo (granos)'),
+  ('arvejas', 'Arvejas'),
+  ('lentejas', 'Lentejas'),
+  ('garbanzos', 'Garbanzos'),
+  ('porotos-negros', 'Porotos negros'),
+  ('porotos', 'Porotos (tipo coscorrón)'),
+  ('cebolla', 'Cebolla'),
+  ('ajo', 'Ajo'),
+  ('tomate', 'Tomate'),
+  ('tomate-conserva', 'Tomate en conserva'),
+  ('salsa-tomate', 'Salsa de tomate (passata)'),
+  ('zanahoria', 'Zanahoria'),
+  ('zapallo-italiano', 'Zapallo italiano'),
+  ('zapallo-camote', 'Zapallo camote'),
+  ('pimenton-rojo', 'Pimentón rojo'),
+  ('pimenton-verde', 'Pimentón verde'),
+  ('lechuga', 'Lechuga'),
+  ('espinaca', 'Espinaca'),
+  ('acelga', 'Acelga'),
+  ('brocoli', 'Brócoli'),
+  ('coliflor', 'Coliflor'),
+  ('champinones', 'Champiñones'),
+  ('pepino', 'Pepino'),
+  ('apio', 'Apio'),
+  ('repollo', 'Repollo'),
+  ('betarraga', 'Betarraga'),
+  ('porotos-verdes', 'Porotos verdes'),
+  ('cilantro', 'Cilantro'),
+  ('perejil', 'Perejil'),
+  ('albahaca', 'Albahaca'),
+  ('palta', 'Palta Hass'),
+  ('platano', 'Plátano'),
+  ('manzana', 'Manzana'),
+  ('naranja', 'Naranja'),
+  ('frutillas', 'Frutillas'),
+  ('arandanos', 'Arándanos'),
+  ('frambuesas', 'Frambuesas'),
+  ('kiwi', 'Kiwi'),
+  ('pera', 'Pera'),
+  ('durazno', 'Durazno'),
+  ('jugo-limon', 'Jugo de limón'),
+  ('aceite-oliva', 'Aceite de oliva'),
+  ('aceite-vegetal', 'Aceite vegetal (maravilla)'),
+  ('almendras', 'Almendras'),
+  ('nueces', 'Nueces'),
+  ('mantequilla-mani', 'Mantequilla de maní'),
+  ('chia', 'Semillas de chía'),
+  ('miel', 'Miel'),
+  ('azucar', 'Azúcar'),
+  ('cacao', 'Cacao amargo en polvo'),
+  ('sal', 'Sal'),
+  ('pimienta', 'Pimienta negra'),
+  ('comino', 'Comino'),
+  ('oregano', 'Orégano'),
+  ('aji-color', 'Ají de color (pimentón dulce)'),
+  ('aji-cayena', 'Ají en polvo (cayena)'),
+  ('canela', 'Canela molida'),
+  ('salsa-soya', 'Salsa de soya'),
+  ('vinagre', 'Vinagre'),
+  ('mostaza', 'Mostaza'),
+  ('polvos-hornear', 'Polvos de hornear'),
+  ('caldo-verduras', 'Caldo de verduras')
+) as v(slug, name)
+where i.household_id is null and i.catalog_slug is null and lower(i.name) = lower(v.name)
+  and not exists (select 1 from public.ingredients x where x.catalog_slug = v.slug);
+
+insert into public.ingredients (household_id, catalog_slug, name, category, default_state, unit_weight_g, exchange_group_code, exchange_grams, exchange_state, allergen_tags)
+select null, v.slug, v.name, v.category, v.state, v.unit_g::numeric, v.ex_group, v.ex_grams::numeric, v.ex_state, v.allergens
+from (values
+  ('pechuga-pollo', 'Pechuga de pollo sin piel', 'carnes', 'raw', null, 'carnes_bajas_grasa', 49, 'raw', '{}'::text[]),
+  ('trutro-pollo', 'Trutro de pollo deshuesado sin piel', 'carnes', 'raw', null, 'carnes_bajas_grasa', 56, 'raw', '{}'::text[]),
+  ('carne-molida-5', 'Carne molida 5 % grasa', 'carnes', 'raw', null, 'carnes_bajas_grasa', 51, 'raw', '{}'::text[]),
+  ('carne-molida-10', 'Carne molida 10 % grasa', 'carnes', 'raw', null, 'carnes_altas_grasa', 55, 'raw', '{}'::text[]),
+  ('posta-negra', 'Posta negra (vacuno magro)', 'carnes', 'raw', null, 'carnes_bajas_grasa', 47, 'raw', '{}'::text[]),
+  ('carne-guisar', 'Carne magra para guisar (sobrecostilla)', 'carnes', 'raw', null, 'carnes_bajas_grasa', 50, 'raw', '{}'::text[]),
+  ('huevo', 'Huevo', 'huevos', 'raw', 50, 'carnes_altas_grasa', 88, 'raw', array['huevo']::text[]),
+  ('clara-huevo', 'Clara de huevo', 'huevos', 'raw', 33, 'carnes_bajas_grasa', 101, 'raw', array['huevo']::text[]),
+  ('proteina-whey', 'Proteína de suero en polvo (whey)', 'otros', 'as_sold', null, 'carnes_bajas_grasa', 14, 'as_sold', array['lactosa']::text[]),
+  ('leche-descremada', 'Leche descremada', 'lacteos', 'as_sold', null, 'lacteos_bajos_grasa', 206, 'as_sold', array['lactosa']::text[]),
+  ('leche-semidescremada', 'Leche semidescremada', 'lacteos', 'as_sold', null, 'lacteos_medios_grasa', 202, 'as_sold', array['lactosa']::text[]),
+  ('yogur-natural', 'Yogur natural descremado', 'lacteos', 'as_sold', null, 'lacteos_bajos_grasa', 125, 'as_sold', array['lactosa']::text[]),
+  ('yogur-griego', 'Yogur griego natural descremado', 'lacteos', 'as_sold', null, 'lacteos_bajos_grasa', 119, 'as_sold', array['lactosa']::text[]),
+  ('queso-cottage', 'Queso cottage 1 %', 'lacteos', 'as_sold', null, 'carnes_bajas_grasa', 89, 'as_sold', array['lactosa']::text[]),
+  ('ricotta', 'Ricotta semidescremada', 'lacteos', 'as_sold', null, 'carnes_altas_grasa', 97, 'as_sold', array['lactosa']::text[]),
+  ('queso-gauda', 'Queso gauda / mantecoso', 'lacteos', 'as_sold', null, 'carnes_altas_grasa', 44, 'as_sold', array['lactosa']::text[]),
+  ('queso-parmesano', 'Queso parmesano rallado', 'lacteos', 'as_sold', null, 'carnes_altas_grasa', 39, 'as_sold', array['lactosa']::text[]),
+  ('queso-mozzarella', 'Queso mozzarella semidescremado', 'lacteos', 'as_sold', null, 'carnes_altas_grasa', 45, 'as_sold', array['lactosa']::text[]),
+  ('mantequilla', 'Mantequilla sin sal', 'grasas', 'as_sold', null, 'aceites_grasas', 25, 'as_sold', array['lactosa']::text[]),
+  ('avena', 'Avena en hojuelas', 'cereales', 'raw', null, 'cereales', 44, 'raw', array['gluten']::text[]),
+  ('arroz', 'Arroz blanco grano largo', 'cereales', 'raw', null, 'cereales', 38, 'raw', '{}'::text[]),
+  ('arroz-integral', 'Arroz integral', 'cereales', 'raw', null, 'cereales', 39, 'raw', '{}'::text[]),
+  ('fideos', 'Fideos / pasta seca', 'cereales', 'raw', null, 'cereales', 40, 'raw', array['gluten']::text[]),
+  ('fideos-integrales', 'Fideos integrales', 'cereales', 'raw', null, 'cereales', 41, 'raw', array['gluten']::text[]),
+  ('cuscus', 'Cuscús', 'cereales', 'raw', null, 'cereales', 39, 'raw', array['gluten']::text[]),
+  ('harina', 'Harina de trigo', 'cereales', 'as_sold', null, 'cereales', 39, 'as_sold', array['gluten']::text[]),
+  ('pan-integral', 'Pan integral de molde', 'panaderia', 'as_sold', 32, 'cereales', 70, 'as_sold', array['gluten']::text[]),
+  ('pan-frances', 'Pan blanco tipo marraqueta', 'panaderia', 'as_sold', null, 'cereales', 58, 'as_sold', array['gluten']::text[]),
+  ('pan-hamburguesa', 'Pan de hamburguesa', 'panaderia', 'as_sold', 44, 'cereales', 60, 'as_sold', array['gluten']::text[]),
+  ('tortilla-harina', 'Tortilla de harina (wrap)', 'panaderia', 'as_sold', 48, 'cereales', 61, 'as_sold', array['gluten']::text[]),
+  ('papa', 'Papa', 'verduras', 'raw', null, 'cereales', 172, 'raw', '{}'::text[]),
+  ('camote', 'Camote', 'verduras', 'raw', null, 'cereales', 149, 'raw', '{}'::text[]),
+  ('choclo', 'Choclo (granos)', 'verduras', 'raw', null, 'cereales', 160, 'raw', '{}'::text[]),
+  ('arvejas', 'Arvejas', 'verduras', 'raw', null, 'cereales', 220, 'raw', '{}'::text[]),
+  ('lentejas', 'Lentejas', 'legumbres', 'raw', null, 'legumbres', 47, 'raw', '{}'::text[]),
+  ('garbanzos', 'Garbanzos', 'legumbres', 'raw', null, 'legumbres', 48, 'raw', '{}'::text[]),
+  ('porotos-negros', 'Porotos negros', 'legumbres', 'raw', null, 'legumbres', 48, 'raw', '{}'::text[]),
+  ('porotos', 'Porotos (tipo coscorrón)', 'legumbres', 'raw', null, 'legumbres', 50, 'raw', '{}'::text[]),
+  ('cebolla', 'Cebolla', 'verduras', 'raw', null, 'verduras_general', 54, 'raw', '{}'::text[]),
+  ('ajo', 'Ajo', 'verduras', 'raw', null, null, null, null, '{}'::text[]),
+  ('tomate', 'Tomate', 'verduras', 'raw', null, 'verduras_general', 129, 'raw', '{}'::text[]),
+  ('tomate-conserva', 'Tomate en conserva', 'verduras', 'as_sold', null, 'verduras_general', 144, 'as_sold', '{}'::text[]),
+  ('salsa-tomate', 'Salsa de tomate (passata)', 'verduras', 'as_sold', null, 'verduras_general', 94, 'as_sold', '{}'::text[]),
+  ('zanahoria', 'Zanahoria', 'verduras', 'raw', null, 'verduras_general', 52, 'raw', '{}'::text[]),
+  ('zapallo-italiano', 'Zapallo italiano', 'verduras', 'raw', null, 'verduras_libre', 80, 'raw', '{}'::text[]),
+  ('zapallo-camote', 'Zapallo camote', 'verduras', 'raw', null, 'verduras_general', 43, 'raw', '{}'::text[]),
+  ('pimenton-rojo', 'Pimentón rojo', 'verduras', 'raw', null, 'verduras_general', 83, 'raw', '{}'::text[]),
+  ('pimenton-verde', 'Pimentón verde', 'verduras', 'raw', null, 'verduras_libre', 54, 'raw', '{}'::text[]),
+  ('lechuga', 'Lechuga', 'verduras', 'raw', null, 'verduras_libre', 76, 'raw', '{}'::text[]),
+  ('espinaca', 'Espinaca', 'verduras', 'raw', null, 'verduras_libre', 69, 'raw', '{}'::text[]),
+  ('acelga', 'Acelga', 'verduras', 'raw', null, 'verduras_libre', 67, 'raw', '{}'::text[]),
+  ('brocoli', 'Brócoli', 'verduras', 'raw', null, 'verduras_general', 75, 'raw', '{}'::text[]),
+  ('coliflor', 'Coliflor', 'verduras', 'raw', null, 'verduras_general', 101, 'raw', '{}'::text[]),
+  ('champinones', 'Champiñones', 'verduras', 'raw', null, 'verduras_libre', 77, 'raw', '{}'::text[]),
+  ('pepino', 'Pepino', 'verduras', 'raw', null, 'verduras_libre', 69, 'raw', '{}'::text[]),
+  ('apio', 'Apio', 'verduras', 'raw', null, 'verduras_libre', 84, 'raw', '{}'::text[]),
+  ('repollo', 'Repollo', 'verduras', 'raw', null, 'verduras_libre', 43, 'raw', '{}'::text[]),
+  ('betarraga', 'Betarraga', 'verduras', 'raw', null, 'verduras_general', 52, 'raw', '{}'::text[]),
+  ('porotos-verdes', 'Porotos verdes', 'verduras', 'raw', null, 'verduras_general', 72, 'raw', '{}'::text[]),
+  ('cilantro', 'Cilantro', 'verduras', 'raw', null, null, null, null, '{}'::text[]),
+  ('perejil', 'Perejil', 'verduras', 'raw', null, null, null, null, '{}'::text[]),
+  ('albahaca', 'Albahaca', 'verduras', 'raw', null, null, null, null, '{}'::text[]),
+  ('palta', 'Palta Hass', 'frutas', 'raw', null, 'alimentos_ricos_lipidos', 97, 'raw', '{}'::text[]),
+  ('platano', 'Plátano', 'frutas', 'raw', null, 'frutas', 66, 'raw', '{}'::text[]),
+  ('manzana', 'Manzana', 'frutas', 'raw', null, 'frutas', 109, 'raw', '{}'::text[]),
+  ('naranja', 'Naranja', 'frutas', 'raw', null, 'frutas', 128, 'raw', '{}'::text[]),
+  ('frutillas', 'Frutillas', 'frutas', 'raw', null, 'frutas', 195, 'raw', '{}'::text[]),
+  ('arandanos', 'Arándanos', 'frutas', 'raw', null, 'frutas', 104, 'raw', '{}'::text[]),
+  ('frambuesas', 'Frambuesas', 'frutas', 'raw', null, 'frutas', 126, 'raw', '{}'::text[]),
+  ('kiwi', 'Kiwi', 'frutas', 'raw', 69, 'frutas', 102, 'raw', '{}'::text[]),
+  ('pera', 'Pera', 'frutas', 'raw', null, 'frutas', 98, 'raw', '{}'::text[]),
+  ('durazno', 'Durazno', 'frutas', 'raw', null, 'frutas', 157, 'raw', '{}'::text[]),
+  ('jugo-limon', 'Jugo de limón', 'frutas', 'as_sold', null, null, null, null, '{}'::text[]),
+  ('aceite-oliva', 'Aceite de oliva', 'grasas', 'as_sold', null, 'aceites_grasas', 20, 'as_sold', '{}'::text[]),
+  ('aceite-vegetal', 'Aceite vegetal (maravilla)', 'grasas', 'as_sold', null, 'aceites_grasas', 20, 'as_sold', '{}'::text[]),
+  ('almendras', 'Almendras', 'frutos_secos', 'as_sold', null, 'alimentos_ricos_lipidos', 30, 'as_sold', array['frutos_secos']::text[]),
+  ('nueces', 'Nueces', 'frutos_secos', 'as_sold', null, 'alimentos_ricos_lipidos', 23, 'as_sold', array['frutos_secos']::text[]),
+  ('mantequilla-mani', 'Mantequilla de maní', 'frutos_secos', 'as_sold', null, 'alimentos_ricos_lipidos', 29, 'as_sold', array['mani']::text[]),
+  ('chia', 'Semillas de chía', 'frutos_secos', 'as_sold', null, 'alimentos_ricos_lipidos', 49, 'as_sold', '{}'::text[]),
+  ('miel', 'Miel', 'otros', 'as_sold', null, 'azucares', 6, 'as_sold', '{}'::text[]),
+  ('azucar', 'Azúcar', 'otros', 'as_sold', null, 'azucares', 5, 'as_sold', '{}'::text[]),
+  ('cacao', 'Cacao amargo en polvo', 'otros', 'as_sold', null, null, null, null, '{}'::text[]),
+  ('sal', 'Sal', 'condimentos', 'as_sold', null, null, null, null, '{}'::text[]),
+  ('pimienta', 'Pimienta negra', 'condimentos', 'as_sold', null, null, null, null, '{}'::text[]),
+  ('comino', 'Comino', 'condimentos', 'as_sold', null, null, null, null, '{}'::text[]),
+  ('oregano', 'Orégano', 'condimentos', 'as_sold', null, null, null, null, '{}'::text[]),
+  ('aji-color', 'Ají de color (pimentón dulce)', 'condimentos', 'as_sold', null, null, null, null, '{}'::text[]),
+  ('aji-cayena', 'Ají en polvo (cayena)', 'condimentos', 'as_sold', null, null, null, null, '{}'::text[]),
+  ('canela', 'Canela molida', 'condimentos', 'as_sold', null, null, null, null, '{}'::text[]),
+  ('salsa-soya', 'Salsa de soya', 'condimentos', 'as_sold', null, null, null, null, array['soya']::text[]),
+  ('vinagre', 'Vinagre', 'condimentos', 'as_sold', null, null, null, null, '{}'::text[]),
+  ('mostaza', 'Mostaza', 'condimentos', 'as_sold', null, null, null, null, '{}'::text[]),
+  ('polvos-hornear', 'Polvos de hornear', 'condimentos', 'as_sold', null, null, null, null, '{}'::text[]),
+  ('caldo-verduras', 'Caldo de verduras', 'condimentos', 'as_sold', null, null, null, null, '{}'::text[])
+) as v(slug, name, category, state, unit_g, ex_group, ex_grams, ex_state, allergens)
+on conflict (catalog_slug) where catalog_slug is not null do update set
+  name = excluded.name, category = excluded.category, default_state = excluded.default_state,
+  unit_weight_g = excluded.unit_weight_g, exchange_group_code = excluded.exchange_group_code,
+  exchange_grams = excluded.exchange_grams, exchange_state = excluded.exchange_state,
+  allergen_tags = excluded.allergen_tags, updated_at = now();
+
+insert into public.ingredient_nutrition (ingredient_id, state, kcal, protein_g, carbs_g, fat_g, fiber_g, sodium_mg, source, source_ref, confidence)
+select i.id, v.state, v.kcal, v.p, v.c, v.f, v.fib, v.na, 'fdc', v.ref, 'calculated'
+from (values
+  ('pechuga-pollo', 'raw', 120, 22.5, 0, 2.62, 0, 45, 'USDA SR28 NDB 05062: CHICKEN,BROILER OR FRYERS,BRST,SKINLESS,BNLESS,MEAT ONLY,RAW'),
+  ('pechuga-pollo', 'cooked', 165, 31.02, 0, 3.57, 0, 74, 'USDA SR28 NDB 05064: CHICKEN,BROILERS OR FRYERS,BREAST,MEAT ONLY,CKD,RSTD'),
+  ('trutro-pollo', 'raw', 121, 19.66, 0, 4.12, 0, 95, 'USDA SR28 NDB 05096: CHICKEN,BROILERS OR FRYERS,DK MEAT,THIGH,MEAT ONLY,RAW'),
+  ('trutro-pollo', 'cooked', 179, 24.76, 0, 8.15, 0, 106, 'USDA SR28 NDB 05098: CHICKEN,BROILERS OR FRYERS,THIGH,MEAT ONLY,CKD,RSTD'),
+  ('carne-molida-5', 'raw', 137, 21.41, 0, 5, 0, 66, 'USDA SR28 NDB 23557: BEEF,GROUND,95% LN MEAT / 5% FAT,RAW'),
+  ('carne-molida-5', 'cooked', 193, 29.17, 0, 7.58, 0, 85, 'USDA SR28 NDB 23560: BEEF,GROUND,95% LN MEAT / 5% FAT,CRUMBLES,CKD,PAN-BROWNED'),
+  ('carne-molida-10', 'raw', 176, 20, 0, 10, 0, 66, 'USDA SR28 NDB 23562: BEEF,GROUND,90% LN MEAT / 10% FAT,RAW'),
+  ('carne-molida-10', 'cooked', 230, 28.45, 0, 12.04, 0, 87, 'USDA SR28 NDB 23565: BEEF,GROUND,90% LN MEAT / 10% FAT,CRUMBLES,CKD,PAN-BROWNED'),
+  ('posta-negra', 'raw', 121, 23.59, 0, 2.94, 0, 54, 'USDA SR28 NDB 23357: BEEF,RND,TOP RND RST,BNLESS,LN,0" FAT,ALL GRDS,RAW'),
+  ('posta-negra', 'cooked', 162, 30.09, 0, 3.77, 0, 67, 'USDA SR28 NDB 23378: BEEF,RND,TOP RND RST,BNLESS,LN,0" FAT,ALL GRDS,CKD,RSTD'),
+  ('carne-guisar', 'raw', 132, 22.11, 0, 4.19, 0, 74, 'USDA SR28 NDB 23603: BEEF,CHUCK,ARM POT RST,LN,1/8" FAT,ALL GRDS,RAW'),
+  ('carne-guisar', 'cooked', 214, 34.66, 0, 7.36, 0, 56, 'USDA SR28 NDB 23602: BEEF,CHUCK,ARM POT RST,LN,1/8" FAT,ALL GRDS,CKD,BRSD'),
+  ('huevo', 'raw', 143, 12.56, 0.72, 9.51, 0, 142, 'USDA SR28 NDB 01123: EGG,WHL,RAW,FRSH'),
+  ('clara-huevo', 'raw', 52, 10.9, 0.73, 0.17, 0, 166, 'USDA SR28 NDB 01124: EGG,WHITE,RAW,FRESH'),
+  ('proteina-whey', 'as_sold', 352, 78.13, 6.25, 1.56, 3.1, 156, 'USDA SR28 NDB 14066: BEVERAGES,PROT PDR WHEY BSD'),
+  ('leche-descremada', 'as_sold', 34, 3.37, 4.96, 0.08, 0, 42, 'USDA SR28 NDB 01085: MILK,NONFAT,FLUID,W/ ADDED VIT A & VIT D (FAT FREE OR SKIM)'),
+  ('leche-semidescremada', 'as_sold', 42, 3.37, 4.99, 0.97, 0, 44, 'USDA SR28 NDB 01082: MILK,LOWFAT,FLUID,1% MILKFAT,W/ ADDED VIT A & VITAMIN D'),
+  ('yogur-natural', 'as_sold', 56, 5.73, 7.68, 0.18, 0, 77, 'USDA SR28 NDB 01118: YOGURT,PLN,SKIM MILK,13 GRAMS PROT PER 8 OZ'),
+  ('yogur-griego', 'as_sold', 59, 10.19, 3.6, 0.39, 0, 36, 'USDA SR28 NDB 01256: YOGURT,GREEK,PLN,NONFAT'),
+  ('queso-cottage', 'as_sold', 72, 12.39, 2.72, 1.02, 0, 406, 'USDA SR28 NDB 01016: CHEESE,COTTAGE,LOWFAT,1% MILKFAT'),
+  ('ricotta', 'as_sold', 138, 11.39, 5.14, 7.91, 0, 99, 'USDA SR28 NDB 01037: CHEESE,RICOTTA,PART SKIM MILK'),
+  ('queso-gauda', 'as_sold', 356, 24.94, 2.22, 27.44, 0, 819, 'USDA SR28 NDB 01022: CHEESE,GOUDA'),
+  ('queso-parmesano', 'as_sold', 420, 28.42, 13.91, 27.84, 0, 1804, 'USDA SR28 NDB 01032: CHEESE,PARMESAN,GRATED'),
+  ('queso-mozzarella', 'as_sold', 254, 24.26, 2.77, 15.92, 0, 619, 'USDA SR28 NDB 01028: CHEESE,MOZZARELLA,PART SKIM MILK'),
+  ('mantequilla', 'as_sold', 717, 0.85, 0.06, 81.11, 0, 11, 'USDA SR28 NDB 01145: BUTTER,WITHOUT SALT'),
+  ('avena', 'raw', 379, 13.15, 67.7, 6.52, 10.1, 6, 'USDA SR28 NDB 08120: CEREALS,OATS,REG & QUICK,NOT FORT,DRY'),
+  ('avena', 'cooked', 71, 2.54, 12, 1.52, 1.7, 4, 'USDA SR28 NDB 08121: CEREALS,OATS,REG & QUICK,UNENR,CKD W/ H2O,WO/ SALT'),
+  ('arroz', 'raw', 365, 7.13, 79.95, 0.66, 1.3, 5, 'USDA SR28 NDB 20444: RICE,WHITE,LONG-GRAIN,REG,RAW,UNENR'),
+  ('arroz', 'cooked', 130, 2.69, 28.17, 0.28, 0.4, 1, 'USDA SR28 NDB 20445: RICE,WHITE,LONG-GRAIN,REG,UNENR,CKD WO/ SALT'),
+  ('arroz-integral', 'raw', 367, 7.54, 76.25, 3.2, 3.6, 5, 'USDA SR28 NDB 20036: RICE,BROWN,LONG-GRAIN,RAW'),
+  ('arroz-integral', 'cooked', 123, 2.74, 25.58, 0.97, 1.6, 4, 'USDA SR28 NDB 20037: RICE,BROWN,LONG-GRAIN,CKD'),
+  ('fideos', 'raw', 371, 13.04, 74.67, 1.51, 3.2, 6, 'USDA SR28 NDB 20120: PASTA,DRY,ENR'),
+  ('fideos', 'cooked', 158, 5.8, 30.86, 0.93, 1.8, 1, 'USDA SR28 NDB 20121: PASTA,CKD,ENR,WO/ ADDED SALT'),
+  ('fideos-integrales', 'raw', 352, 13.87, 73.37, 2.93, 9.2, 6, 'USDA SR28 NDB 20124: PASTA,WHOLE-WHEAT,DRY'),
+  ('fideos-integrales', 'cooked', 149, 5.99, 30.07, 1.71, 3.9, 4, 'USDA SR28 NDB 20125: PASTA,WHOLE-WHEAT,CKD'),
+  ('cuscus', 'raw', 376, 12.76, 77.43, 0.64, 5, 10, 'USDA SR28 NDB 20028: COUSCOUS,DRY'),
+  ('cuscus', 'cooked', 112, 3.79, 23.22, 0.16, 1.4, 5, 'USDA SR28 NDB 20029: COUSCOUS,COOKED'),
+  ('harina', 'as_sold', 364, 10.33, 76.31, 0.98, 2.7, 2, 'USDA SR28 NDB 20081: WHEAT FLR,WHITE,ALL-PURPOSE,ENR,BLEACHED'),
+  ('pan-integral', 'as_sold', 252, 12.45, 42.71, 3.5, 6, 455, 'USDA SR28 NDB 18075: BREAD,WHOLE-WHEAT,COMM. PREPARED'),
+  ('pan-frances', 'as_sold', 272, 10.75, 51.88, 2.42, 2.2, 602, 'USDA SR28 NDB 18029: Bread, french'),
+  ('pan-hamburguesa', 'as_sold', 279, 9.77, 50.12, 3.91, 1.8, 494, 'USDA SR28 NDB 18350: ROLLS,HAMBURGER OR HOTDOG,PLN'),
+  ('tortilla-harina', 'as_sold', 306, 8.2, 49.38, 7.99, 3.5, 736, 'USDA SR28 NDB 18364: TORTILLAS,RTB OR -FRY,FLR,REFR'),
+  ('papa', 'raw', 77, 2.05, 17.49, 0.09, 2.1, 6, 'USDA SR28 NDB 11352: POTATOES,FLESH & SKN,RAW'),
+  ('papa', 'cooked', 93, 2.5, 21.15, 0.13, 2.2, 10, 'USDA SR28 NDB 11674: POTATOES,BKD,FLESH & SKN,WO/ SALT'),
+  ('camote', 'raw', 86, 1.57, 20.12, 0.05, 3, 55, 'USDA SR28 NDB 11507: SWEET POTATO,RAW,UNPREP'),
+  ('camote', 'cooked', 90, 2.01, 20.71, 0.15, 3.3, 36, 'USDA SR28 NDB 11508: SWEET POTATO,CKD,BKD IN SKN,FLESH,WO/ SALT'),
+  ('choclo', 'raw', 86, 3.27, 18.7, 1.35, 2, 15, 'USDA SR28 NDB 11167: CORN,SWT,YEL,RAW'),
+  ('arvejas', 'raw', 77, 5.22, 13.62, 0.4, 4.5, 108, 'USDA SR28 NDB 11312: PEAS,GRN,FRZ,UNPREP'),
+  ('lentejas', 'raw', 352, 24.63, 63.35, 1.06, 10.7, 6, 'USDA SR28 NDB 16069: LENTILS,RAW'),
+  ('lentejas', 'cooked', 116, 9.02, 20.13, 0.38, 7.9, 2, 'USDA SR28 NDB 16070: LENTILS,MATURE SEEDS,CKD,BLD,WO/SALT'),
+  ('garbanzos', 'raw', 378, 20.47, 62.95, 6.04, 12.2, 24, 'USDA SR28 NDB 16056: CHICKPEAS (GARBANZO BNS,BENGAL GM),MATURE SEEDS,RAW'),
+  ('garbanzos', 'cooked', 164, 8.86, 27.42, 2.59, 7.6, 7, 'USDA SR28 NDB 16057: CHICKPEAS ,MATURE SEEDS,CKD,BLD,WO/SALT'),
+  ('porotos-negros', 'raw', 341, 21.6, 62.36, 1.42, 15.5, 5, 'USDA SR28 NDB 16014: BEANS,BLACK,MATURE SEEDS,RAW'),
+  ('porotos-negros', 'cooked', 132, 8.86, 23.71, 0.54, 8.7, 1, 'USDA SR28 NDB 16015: BEANS,BLACK,MATURE SEEDS,CKD,BLD,WO/SALT'),
+  ('porotos', 'raw', 335, 23.03, 60.05, 1.23, 24.7, 6, 'USDA SR28 NDB 16019: BEANS,CRANBERRY (ROMAN),MATURE SEEDS,RAW'),
+  ('porotos', 'cooked', 136, 9.34, 24.46, 0.46, 8.6, 1, 'USDA SR28 NDB 16020: BEANS,CRANBERRY (ROMAN),MATURE SEEDS,CKD,BLD,WO/SALT'),
+  ('cebolla', 'raw', 40, 1.1, 9.34, 0.1, 1.7, 4, 'USDA SR28 NDB 11282: ONIONS,RAW'),
+  ('ajo', 'raw', 149, 6.36, 33.06, 0.5, 2.1, 17, 'USDA SR28 NDB 11215: GARLIC,RAW'),
+  ('tomate', 'raw', 18, 0.88, 3.89, 0.2, 1.2, 5, 'USDA SR28 NDB 11529: TOMATOES,RED,RIPE,RAW,YEAR RND AVERAGE'),
+  ('tomate-conserva', 'as_sold', 16, 0.79, 3.47, 0.25, 1.9, 115, 'USDA SR28 NDB 11531: TOMATOES,RED,RIPE,CND,PACKED IN TOMATO JUC'),
+  ('salsa-tomate', 'as_sold', 24, 1.2, 5.31, 0.3, 1.5, 474, 'USDA SR28 NDB 11549: TOMATO PRODUCTS,CND,SAU'),
+  ('zanahoria', 'raw', 41, 0.93, 9.58, 0.24, 2.8, 69, 'USDA SR28 NDB 11124: CARROTS,RAW'),
+  ('zapallo-italiano', 'raw', 17, 1.21, 3.11, 0.32, 1, 8, 'USDA SR28 NDB 11477: SQUASH,SMMR,ZUCCHINI,INCL SKN,RAW'),
+  ('zapallo-camote', 'raw', 45, 1, 11.69, 0.1, 2, 4, 'USDA SR28 NDB 11485: SQUASH,WNTR,BUTTERNUT,RAW'),
+  ('pimenton-rojo', 'raw', 31, 0.99, 6.03, 0.3, 2.1, 4, 'USDA SR28 NDB 11821: PEPPERS,SWT,RED,RAW'),
+  ('pimenton-verde', 'raw', 20, 0.86, 4.64, 0.17, 1.7, 3, 'USDA SR28 NDB 11333: PEPPERS,SWT,GRN,RAW'),
+  ('lechuga', 'raw', 17, 1.23, 3.29, 0.3, 2.1, 8, 'USDA SR28 NDB 11251: LETTUCE,COS OR ROMAINE,RAW'),
+  ('espinaca', 'raw', 23, 2.86, 3.63, 0.39, 2.2, 79, 'USDA SR28 NDB 11457: SPINACH,RAW'),
+  ('acelga', 'raw', 19, 1.8, 3.74, 0.2, 1.6, 213, 'USDA SR28 NDB 11147: CHARD,SWISS,RAW'),
+  ('brocoli', 'raw', 34, 2.82, 6.64, 0.37, 2.6, 33, 'USDA SR28 NDB 11090: BROCCOLI,RAW'),
+  ('coliflor', 'raw', 25, 1.92, 4.97, 0.28, 2, 30, 'USDA SR28 NDB 11135: CAULIFLOWER,RAW'),
+  ('champinones', 'raw', 22, 3.09, 3.26, 0.34, 1, 5, 'USDA SR28 NDB 11260: MUSHROOMS,WHITE,RAW'),
+  ('pepino', 'raw', 15, 0.65, 3.63, 0.11, 0.5, 2, 'USDA SR28 NDB 11205: CUCUMBER,WITH PEEL,RAW'),
+  ('apio', 'raw', 16, 0.69, 2.97, 0.17, 1.6, 80, 'USDA SR28 NDB 11143: CELERY,RAW'),
+  ('repollo', 'raw', 25, 1.28, 5.8, 0.1, 2.5, 18, 'USDA SR28 NDB 11109: CABBAGE,RAW'),
+  ('betarraga', 'raw', 43, 1.61, 9.56, 0.17, 2.8, 78, 'USDA SR28 NDB 11080: BEETS,RAW'),
+  ('porotos-verdes', 'raw', 31, 1.83, 6.97, 0.22, 2.7, 6, 'USDA SR28 NDB 11052: BEANS,SNAP,GREEN,RAW'),
+  ('cilantro', 'raw', 23, 2.13, 3.67, 0.52, 2.8, 46, 'USDA SR28 NDB 11165: CORIANDER (CILANTRO) LEAVES,RAW'),
+  ('perejil', 'raw', 36, 2.97, 6.33, 0.79, 3.3, 56, 'USDA SR28 NDB 11297: PARSLEY,FRSH'),
+  ('albahaca', 'raw', 23, 3.15, 2.65, 0.64, 1.6, 4, 'USDA SR28 NDB 02044: BASIL,FRESH'),
+  ('palta', 'raw', 167, 1.96, 8.64, 15.41, 6.8, 8, 'USDA SR28 NDB 09038: AVOCADOS,RAW,CALIFORNIA'),
+  ('platano', 'raw', 89, 1.09, 22.84, 0.33, 2.6, 1, 'USDA SR28 NDB 09040: BANANAS,RAW'),
+  ('manzana', 'raw', 52, 0.26, 13.81, 0.17, 2.4, 1, 'USDA SR28 NDB 09003: APPLES,RAW,WITH SKIN'),
+  ('naranja', 'raw', 47, 0.94, 11.75, 0.12, 2.4, 0, 'USDA SR28 NDB 09200: ORANGES,RAW,ALL COMM VAR'),
+  ('frutillas', 'raw', 32, 0.67, 7.68, 0.3, 2, 1, 'USDA SR28 NDB 09316: STRAWBERRIES,RAW'),
+  ('arandanos', 'raw', 57, 0.74, 14.49, 0.33, 2.4, 1, 'USDA SR28 NDB 09050: BLUEBERRIES,RAW'),
+  ('frambuesas', 'raw', 52, 1.2, 11.94, 0.65, 6.5, 1, 'USDA SR28 NDB 09302: RASPBERRIES,RAW'),
+  ('kiwi', 'raw', 61, 1.14, 14.66, 0.52, 3, 3, 'USDA SR28 NDB 09148: KIWIFRUIT,GRN,RAW'),
+  ('pera', 'raw', 57, 0.36, 15.23, 0.14, 3.1, 1, 'USDA SR28 NDB 09252: PEARS,RAW'),
+  ('durazno', 'raw', 39, 0.91, 9.54, 0.25, 1.5, 0, 'USDA SR28 NDB 09236: PEACHES,YEL,RAW'),
+  ('jugo-limon', 'as_sold', 22, 0.35, 6.9, 0.24, 0.3, 1, 'USDA SR28 NDB 09152: LEMON JUICE,RAW'),
+  ('aceite-oliva', 'as_sold', 884, 0, 0, 100, 0, 2, 'USDA SR28 NDB 04053: OIL,OLIVE,SALAD OR COOKING'),
+  ('aceite-vegetal', 'as_sold', 884, 0, 0, 100, 0, 0, 'USDA SR28 NDB 04506: OIL,SUNFLOWER,LINOLEIC,(APPROX. 65%)'),
+  ('almendras', 'as_sold', 579, 21.15, 21.55, 49.93, 12.5, 1, 'USDA SR28 NDB 12061: ALMONDS'),
+  ('nueces', 'as_sold', 654, 15.23, 13.71, 65.21, 6.7, 2, 'USDA SR28 NDB 12155: WALNUTS,ENGLISH'),
+  ('mantequilla-mani', 'as_sold', 598, 22.21, 22.31, 51.36, 5, 17, 'USDA SR28 NDB 16398: PEANUT BUTTER,SMOOTH STYLE,WO/SALT'),
+  ('chia', 'as_sold', 486, 16.54, 42.12, 30.74, 34.4, 16, 'USDA SR28 NDB 12006: CHIA SEEDS,DRIED'),
+  ('miel', 'as_sold', 304, 0.3, 82.4, 0, 0.2, 4, 'USDA SR28 NDB 19296: HONEY'),
+  ('azucar', 'as_sold', 387, 0, 99.98, 0, 0, 1, 'USDA SR28 NDB 19335: SUGARS,GRANULATED'),
+  ('cacao', 'as_sold', 228, 19.6, 57.9, 13.7, 37, 21, 'USDA SR28 NDB 19165: COCOA,DRY PDR,UNSWTND'),
+  ('sal', 'as_sold', 0, 0, 0, 0, 0, 38758, 'USDA SR28 NDB 02047: SALT,TABLE'),
+  ('pimienta', 'as_sold', 251, 10.39, 63.95, 3.26, 25.3, 20, 'USDA SR28 NDB 02030: PEPPER,BLACK'),
+  ('comino', 'as_sold', 375, 17.81, 44.24, 22.27, 10.5, 168, 'USDA SR28 NDB 02014: CUMIN SEED'),
+  ('oregano', 'as_sold', 265, 9, 68.92, 4.28, 42.5, 25, 'USDA SR28 NDB 02027: SPICES,OREGANO,DRIED'),
+  ('aji-color', 'as_sold', 282, 14.14, 53.99, 12.89, 34.9, 68, 'USDA SR28 NDB 02028: PAPRIKA'),
+  ('aji-cayena', 'as_sold', 318, 12.01, 56.63, 17.27, 27.2, 30, 'USDA SR28 NDB 02031: PEPPER,RED OR CAYENNE'),
+  ('canela', 'as_sold', 247, 3.99, 80.59, 1.24, 53.1, 10, 'USDA SR28 NDB 02010: CINNAMON,GROUND'),
+  ('salsa-soya', 'as_sold', 60, 10.51, 5.57, 0.1, 0.8, 5586, 'USDA SR28 NDB 16124: SOY SAU MADE FROM SOY (TAMARI)'),
+  ('vinagre', 'as_sold', 18, 0, 0.04, 0, 0, 2, 'USDA SR28 NDB 02053: VINEGAR,DISTILLED'),
+  ('mostaza', 'as_sold', 60, 3.74, 5.83, 3.34, 4, 1104, 'USDA SR28 NDB 02046: MUSTARD,PREPARED,YELLOW'),
+  ('polvos-hornear', 'as_sold', 53, 0, 27.7, 0, 0.2, 10600, 'USDA SR28 NDB 18369: LEAVENING AGENTS,BAKING PDR,DOUBLE-ACTING,NA AL SULFATE'),
+  ('caldo-verduras', 'as_sold', 6, 0.23, 1.02, 0.07, 0, 303, 'USDA SR28 NDB 06615: SOUP,SWANSON,VEG BROTH')
+) as v(slug, state, kcal, p, c, f, fib, na, ref)
+join public.ingredients i on i.catalog_slug = v.slug
+on conflict (ingredient_id, state) do update set
+  kcal = excluded.kcal, protein_g = excluded.protein_g, carbs_g = excluded.carbs_g, fat_g = excluded.fat_g,
+  fiber_g = excluded.fiber_g, sodium_mg = excluded.sodium_mg, source = excluded.source,
+  source_ref = excluded.source_ref, confidence = excluded.confidence;
+
+insert into public.ingredient_yields (ingredient_id, method, yield_factor)
+select i.id, 'default', v.y
+from (values
+  ('pechuga-pollo', 0.73),
+  ('trutro-pollo', 0.79),
+  ('carne-molida-5', 0.73),
+  ('carne-molida-10', 0.7),
+  ('posta-negra', 0.78),
+  ('carne-guisar', 0.64),
+  ('arroz', 2.8),
+  ('arroz-integral', 2.97),
+  ('fideos', 2.38),
+  ('fideos-integrales', 2.4),
+  ('cuscus', 3.33),
+  ('papa', 0.83),
+  ('camote', 0.94),
+  ('lentejas', 3.02),
+  ('garbanzos', 2.32),
+  ('porotos-negros', 2.6),
+  ('porotos', 2.48)
+) as v(slug, y)
+join public.ingredients i on i.catalog_slug = v.slug
+on conflict (ingredient_id, method) do update set yield_factor = excluded.yield_factor;
+
+-- Rendimientos que el catálogo ya no define
+delete from public.ingredient_yields y
+using public.ingredients i
+where y.ingredient_id = i.id and i.catalog_slug is not null and y.method = 'default'
+  and i.catalog_slug <> all (array['pechuga-pollo', 'trutro-pollo', 'carne-molida-5', 'carne-molida-10', 'posta-negra', 'carne-guisar', 'arroz', 'arroz-integral', 'fideos', 'fideos-integrales', 'cuscus', 'papa', 'camote', 'lentejas', 'garbanzos', 'porotos-negros', 'porotos']::text[]);
+
+insert into public.recipe_catalog (slug, name, category, tags, prep_minutes, servings_nominal, is_homogeneous, expected_cooked_yield_g, instructions, lines)
+select v.slug, v.name, v.category, v.tags, v.prep::int, v.servings::numeric, v.homog, v.yield_g::numeric, v.instructions, v.lines
+from (values
+  ('avena-proteica-platano', 'Avena cocida con proteína y plátano', 'desayunos', array['alta en proteínas', 'rápida', 'vegetariana']::text[], 10, 1, false, null, 'Cocina la avena en la leche a fuego bajo 4 a 5 minutos, revolviendo, hasta que espese. Retira del fuego y deja entibiar un minuto antes de incorporar la proteína (así no se apelotona). Sirve con el plátano en rodajas y la canela.', '[{"ingredient":"avena","grams":40,"state":"raw","role":"adjustable","min_g":20,"max_g":80},{"ingredient":"leche-descremada","grams":200,"state":"as_sold","role":"adjustable","min_g":100,"max_g":350},{"ingredient":"proteina-whey","grams":25,"state":"as_sold","role":"adjustable","min_g":0,"max_g":40},{"ingredient":"platano","grams":60,"state":"raw","role":"side","min_g":0,"max_g":120},{"ingredient":"canela","grams":1,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('huevos-revueltos-tostadas', 'Huevos revueltos con tostadas integrales', 'desayunos', array['rápida', 'sin lactosa', 'vegetariana']::text[], 10, 1, false, null, 'Bate los huevos con la sal. Calienta el aceite en un sartén antiadherente a fuego medio-bajo, agrega los huevos y revuelve con espátula sin parar hasta que cuajen cremosos. Sirve con las tostadas y el tomate en rodajas.', '[{"ingredient":"huevo","grams":100,"state":"raw","role":"adjustable","min_g":50,"max_g":200,"integer_unit_g":50},{"ingredient":"aceite-oliva","grams":3,"state":"as_sold","role":"adjustable","min_g":2,"max_g":6},{"ingredient":"pan-integral","grams":64,"state":"as_sold","role":"side","min_g":0,"max_g":96,"integer_unit_g":32},{"ingredient":"tomate","grams":80,"state":"raw","role":"side","min_g":0,"max_g":160},{"ingredient":"sal","grams":0.5,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('yogur-griego-frutos-rojos', 'Yogur griego con frutos rojos, avena y almendras', 'desayunos', array['alta en proteínas', 'rápida', 'vegetariana']::text[], 5, 1, false, null, 'Sirve el yogur en un bol, agrega la fruta picada, la avena cruda y las almendras picadas. Termina con un hilo de miel.', '[{"ingredient":"yogur-griego","grams":170,"state":"as_sold","role":"adjustable","min_g":100,"max_g":300},{"ingredient":"frutillas","grams":60,"state":"raw","role":"side","min_g":0,"max_g":150},{"ingredient":"arandanos","grams":40,"state":"raw","role":"side","min_g":0,"max_g":100},{"ingredient":"avena","grams":20,"state":"raw","role":"side","min_g":0,"max_g":50},{"ingredient":"almendras","grams":10,"state":"as_sold","role":"adjustable","min_g":0,"max_g":25},{"ingredient":"miel","grams":5,"state":"as_sold","role":"adjustable","min_g":0,"max_g":10}]'::jsonb),
+  ('tostadas-palta-huevo', 'Tostadas con palta y huevo', 'desayunos', array['rápida', 'sin lactosa', 'vegetariana']::text[], 10, 1, false, null, 'Tuesta el pan. Muele la palta con la sal y la pimienta y úntala. Cocina el huevo a la plancha o pochado (3 minutos en agua apenas hirviendo) y ponlo encima. Acompaña con tomate.', '[{"ingredient":"pan-integral","grams":64,"state":"as_sold","role":"side","min_g":32,"max_g":96,"integer_unit_g":32},{"ingredient":"palta","grams":50,"state":"raw","role":"adjustable","min_g":25,"max_g":90},{"ingredient":"huevo","grams":50,"state":"raw","role":"adjustable","min_g":50,"max_g":150,"integer_unit_g":50},{"ingredient":"tomate","grams":50,"state":"raw","role":"side","min_g":0,"max_g":120},{"ingredient":"sal","grams":0.5,"state":"as_sold","role":"fixed"},{"ingredient":"pimienta","grams":0.2,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('panqueques-avena-platano', 'Panqueques de avena y plátano', 'desayunos', array['batch cooking', 'congelable', 'rápida', 'sin lactosa', 'vegetariana']::text[], 20, 2, true, 400, 'Procesa la avena hasta que quede como harina. Agrega el huevo, las claras, el plátano, los polvos de hornear y la canela y licúa hasta tener una masa lisa. Deja reposar 5 minutos. Pinta un sartén con el aceite y cocina porciones de masa a fuego medio, 1 a 2 minutos por lado. Pesa el total de panqueques para que las porciones queden exactas. Sirve con frutillas y miel.', '[{"ingredient":"avena","grams":40,"state":"raw","role":"adjustable"},{"ingredient":"huevo","grams":50,"state":"raw","role":"adjustable"},{"ingredient":"clara-huevo","grams":66,"state":"raw","role":"adjustable"},{"ingredient":"platano","grams":60,"state":"raw","role":"adjustable"},{"ingredient":"polvos-hornear","grams":2,"state":"as_sold","role":"fixed"},{"ingredient":"canela","grams":1,"state":"as_sold","role":"fixed"},{"ingredient":"aceite-vegetal","grams":2,"state":"as_sold","role":"adjustable"},{"ingredient":"frutillas","grams":60,"state":"raw","role":"side","min_g":0,"max_g":150},{"ingredient":"miel","grams":6,"state":"as_sold","role":"side","min_g":0,"max_g":12}]'::jsonb),
+  ('batido-proteina-frutilla', 'Batido de proteína con frutilla y avena', 'desayunos', array['alta en proteínas', 'rápida', 'vegetariana']::text[], 5, 1, false, null, 'Licúa todo con un par de cubos de hielo hasta que quede homogéneo. Si usas frutillas congeladas, no necesitas hielo.', '[{"ingredient":"leche-descremada","grams":250,"state":"as_sold","role":"adjustable","min_g":150,"max_g":400},{"ingredient":"proteina-whey","grams":25,"state":"as_sold","role":"adjustable","min_g":0,"max_g":40},{"ingredient":"frutillas","grams":120,"state":"raw","role":"adjustable","min_g":60,"max_g":200},{"ingredient":"avena","grams":20,"state":"raw","role":"adjustable","min_g":0,"max_g":50}]'::jsonb),
+  ('tostadas-ricotta-tomate', 'Tostadas con ricotta, tomate y orégano', 'desayunos', array['rápida', 'vegetariana']::text[], 5, 1, false, null, 'Tuesta el pan, unta la ricotta, cubre con tomate en rodajas y termina con aceite de oliva, orégano y sal.', '[{"ingredient":"pan-integral","grams":64,"state":"as_sold","role":"side","min_g":32,"max_g":96,"integer_unit_g":32},{"ingredient":"ricotta","grams":60,"state":"as_sold","role":"adjustable","min_g":30,"max_g":120},{"ingredient":"tomate","grams":80,"state":"raw","role":"adjustable","min_g":40,"max_g":160},{"ingredient":"aceite-oliva","grams":3,"state":"as_sold","role":"adjustable","min_g":0,"max_g":6},{"ingredient":"oregano","grams":0.3,"state":"as_sold","role":"fixed"},{"ingredient":"sal","grams":0.3,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('tallarines-bolonesa', 'Tallarines con salsa boloñesa', 'almuerzos', array['batch cooking', 'congelable']::text[], 50, 4, true, null, 'Pica fino cebolla, zanahoria y ajo y sofríelos en el aceite a fuego bajo 8 minutos (soffritto). Sube el fuego, agrega la carne y dórala bien, rompiéndola. Incorpora la salsa de tomate, el orégano y la sal y cocina tapado a fuego mínimo 25 a 30 minutos. Pesa la olla con la salsa terminada (descontando la tara). Cocina los fideos al dente por separado: cada uno recibe sus gramos de salsa y de pasta.', '[{"ingredient":"carne-molida-5","grams":125,"state":"raw","role":"adjustable"},{"ingredient":"salsa-tomate","grams":120,"state":"as_sold","role":"adjustable"},{"ingredient":"cebolla","grams":40,"state":"raw","role":"adjustable"},{"ingredient":"zanahoria","grams":30,"state":"raw","role":"adjustable"},{"ingredient":"ajo","grams":4,"state":"raw","role":"fixed"},{"ingredient":"aceite-oliva","grams":5,"state":"as_sold","role":"adjustable"},{"ingredient":"oregano","grams":0.5,"state":"as_sold","role":"fixed"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"},{"ingredient":"fideos","grams":80,"state":"raw","role":"side","min_g":0,"max_g":160},{"ingredient":"queso-parmesano","grams":5,"state":"as_sold","role":"side","min_g":0,"max_g":15}]'::jsonb),
+  ('lentejas-con-arroz', 'Lentejas guisadas con arroz', 'almuerzos', array['batch cooking', 'congelable', 'económica', 'sin gluten', 'sin lactosa', 'vegetariana']::text[], 60, 4, true, null, 'Remoja las lentejas la noche anterior (opcional) y enjuágalas. Sofríe cebolla, pimentón, zanahoria y ajo en el aceite con el comino y el ají de color. Agrega las lentejas, el zapallo en cubos y agua que las cubra por 3 cm; cocina 35 a 40 minutos hasta que estén blandas, agregando agua si hace falta. Sala al final. Pesa la olla terminada. Cocina el arroz aparte.', '[{"ingredient":"lentejas","grams":60,"state":"raw","role":"adjustable"},{"ingredient":"zapallo-camote","grams":60,"state":"raw","role":"adjustable"},{"ingredient":"cebolla","grams":30,"state":"raw","role":"adjustable"},{"ingredient":"zanahoria","grams":30,"state":"raw","role":"adjustable"},{"ingredient":"pimenton-rojo","grams":20,"state":"raw","role":"adjustable"},{"ingredient":"ajo","grams":3,"state":"raw","role":"fixed"},{"ingredient":"comino","grams":0.5,"state":"as_sold","role":"fixed"},{"ingredient":"aji-color","grams":0.5,"state":"as_sold","role":"fixed"},{"ingredient":"aceite-oliva","grams":4,"state":"as_sold","role":"adjustable"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"},{"ingredient":"arroz","grams":30,"state":"raw","role":"side","min_g":0,"max_g":80}]'::jsonb),
+  ('porotos-con-riendas', 'Porotos con riendas', 'almuerzos', array['batch cooking', 'congelable', 'económica', 'sin lactosa', 'vegetariana']::text[], 90, 4, true, null, 'Remoja los porotos 12 horas y cuécelos en agua nueva 60 a 70 minutos. Aparte, sofríe cebolla y ajo con el ají de color en el aceite y agrégalo a la olla junto con el zapallo en cubos. Cuando el zapallo esté blando, aplástalo un poco para espesar, agrega los tallarines quebrados y cocina 10 minutos más. Sala al final y pesa la olla.', '[{"ingredient":"porotos","grams":60,"state":"raw","role":"adjustable"},{"ingredient":"zapallo-camote","grams":80,"state":"raw","role":"adjustable"},{"ingredient":"fideos","grams":20,"state":"raw","role":"adjustable"},{"ingredient":"cebolla","grams":30,"state":"raw","role":"adjustable"},{"ingredient":"ajo","grams":3,"state":"raw","role":"fixed"},{"ingredient":"aji-color","grams":1,"state":"as_sold","role":"fixed"},{"ingredient":"aceite-oliva","grams":4,"state":"as_sold","role":"adjustable"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('garbanzos-espinaca', 'Garbanzos guisados con espinaca', 'almuerzos', array['batch cooking', 'congelable', 'sin gluten', 'sin lactosa', 'vegetariana']::text[], 45, 4, true, null, 'Cuece los garbanzos remojados hasta que estén tiernos (o usa garbanzos ya cocidos). Sofríe cebolla y ajo con las especias, agrega el tomate y cocina 10 minutos. Incorpora los garbanzos con un poco de su caldo y cocina 10 minutos más. Al final agrega la espinaca y deja que se marchite. Pesa la olla. El arroz integral va aparte.', '[{"ingredient":"garbanzos","grams":60,"state":"raw","role":"adjustable"},{"ingredient":"tomate-conserva","grams":100,"state":"as_sold","role":"adjustable"},{"ingredient":"espinaca","grams":60,"state":"raw","role":"adjustable"},{"ingredient":"cebolla","grams":40,"state":"raw","role":"adjustable"},{"ingredient":"ajo","grams":4,"state":"raw","role":"fixed"},{"ingredient":"comino","grams":0.5,"state":"as_sold","role":"fixed"},{"ingredient":"aji-color","grams":0.5,"state":"as_sold","role":"fixed"},{"ingredient":"aceite-oliva","grams":5,"state":"as_sold","role":"adjustable"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"},{"ingredient":"arroz-integral","grams":30,"state":"raw","role":"side","min_g":0,"max_g":80}]'::jsonb),
+  ('charquican', 'Charquicán', 'almuerzos', array['batch cooking', 'sin gluten', 'sin lactosa']::text[], 50, 4, true, null, 'Sofríe cebolla y ajo en el aceite, agrega la carne y dórala con el comino y el orégano. Suma la papa y el zapallo en cubos y una taza de agua; cocina tapado 20 minutos. Agrega choclo y arvejas, cocina 5 minutos más y muele grueso con un tenedor. Sala y pesa la olla. El huevo (frito o a la plancha) es opcional y va por persona.', '[{"ingredient":"carne-molida-5","grams":90,"state":"raw","role":"adjustable"},{"ingredient":"papa","grams":150,"state":"raw","role":"adjustable"},{"ingredient":"zapallo-camote","grams":100,"state":"raw","role":"adjustable"},{"ingredient":"choclo","grams":40,"state":"raw","role":"adjustable"},{"ingredient":"arvejas","grams":30,"state":"raw","role":"adjustable"},{"ingredient":"cebolla","grams":40,"state":"raw","role":"adjustable"},{"ingredient":"ajo","grams":3,"state":"raw","role":"fixed"},{"ingredient":"comino","grams":0.5,"state":"as_sold","role":"fixed"},{"ingredient":"oregano","grams":0.3,"state":"as_sold","role":"fixed"},{"ingredient":"aceite-vegetal","grams":4,"state":"as_sold","role":"adjustable"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"},{"ingredient":"huevo","grams":50,"state":"raw","role":"side","min_g":0,"max_g":100,"integer_unit_g":50}]'::jsonb),
+  ('cazuela-pollo', 'Cazuela de pollo', 'almuerzos', array['alta en proteínas', 'batch cooking', 'sin gluten', 'sin lactosa']::text[], 60, 4, true, 2800, 'Sella el pollo en una olla grande, agrega cebolla, ajo y zanahoria y cubre con 1,2 litros de agua. Cocina 20 minutos. Suma papa, zapallo y arroz y cocina 15 minutos; al final agrega choclo y porotos verdes por 5 minutos. Sala, perfuma con orégano y pesa la olla con el caldo: la cazuela se reparte por peso, con caldo incluido.', '[{"ingredient":"trutro-pollo","grams":120,"state":"raw","role":"adjustable"},{"ingredient":"papa","grams":120,"state":"raw","role":"adjustable"},{"ingredient":"zapallo-camote","grams":80,"state":"raw","role":"adjustable"},{"ingredient":"choclo","grams":50,"state":"raw","role":"adjustable"},{"ingredient":"porotos-verdes","grams":30,"state":"raw","role":"adjustable"},{"ingredient":"zanahoria","grams":30,"state":"raw","role":"adjustable"},{"ingredient":"arroz","grams":10,"state":"raw","role":"adjustable"},{"ingredient":"cebolla","grams":30,"state":"raw","role":"adjustable"},{"ingredient":"ajo","grams":3,"state":"raw","role":"fixed"},{"ingredient":"oregano","grams":0.3,"state":"as_sold","role":"fixed"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('pollo-horno-papas-ensalada', 'Pollo al horno con papas y ensalada', 'almuerzos', array['alta en proteínas', 'sin gluten', 'sin lactosa']::text[], 50, 1, false, null, 'Adoba el pollo con limón, ají de color, orégano y sal. Corta las papas en gajos. Hornea todo a 200 °C: las papas 40 minutos y el pollo los últimos 20 a 25 (hasta 74 °C en el centro). Arma la ensalada y alíñala con el aceite y el resto del limón.', '[{"ingredient":"pechuga-pollo","grams":150,"state":"raw","role":"adjustable","min_g":100,"max_g":280},{"ingredient":"papa","grams":180,"state":"raw","role":"side","min_g":0,"max_g":350},{"ingredient":"lechuga","grams":60,"state":"raw","role":"side","min_g":0,"max_g":150},{"ingredient":"tomate","grams":80,"state":"raw","role":"side","min_g":0,"max_g":160},{"ingredient":"aceite-oliva","grams":8,"state":"as_sold","role":"ratio","ratio_group":"aliño"},{"ingredient":"jugo-limon","grams":8,"state":"as_sold","role":"ratio","ratio_group":"aliño"},{"ingredient":"aji-color","grams":0.5,"state":"as_sold","role":"fixed"},{"ingredient":"oregano","grams":0.3,"state":"as_sold","role":"fixed"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('arroz-salteado-pollo', 'Salteado de pollo y verduras con arroz', 'almuerzos', array['alta en proteínas', 'sin gluten', 'sin lactosa']::text[], 25, 2, true, null, 'Cocina el arroz. Corta el pollo en tiras y las verduras en trozos parejos. En un wok o sartén muy caliente con el aceite, saltea el pollo hasta dorar y retíralo. Saltea las verduras 3 a 4 minutos (deben quedar crujientes), devuelve el pollo, agrega ajo y salsa de soya y mezcla 1 minuto. Pesa el salteado y reparte; el arroz va aparte.', '[{"ingredient":"pechuga-pollo","grams":130,"state":"raw","role":"adjustable"},{"ingredient":"brocoli","grams":80,"state":"raw","role":"adjustable"},{"ingredient":"zanahoria","grams":40,"state":"raw","role":"adjustable"},{"ingredient":"pimenton-rojo","grams":40,"state":"raw","role":"adjustable"},{"ingredient":"cebolla","grams":30,"state":"raw","role":"adjustable"},{"ingredient":"ajo","grams":3,"state":"raw","role":"fixed"},{"ingredient":"salsa-soya","grams":10,"state":"as_sold","role":"fixed"},{"ingredient":"aceite-vegetal","grams":6,"state":"as_sold","role":"adjustable"},{"ingredient":"arroz","grams":60,"state":"raw","role":"side","min_g":0,"max_g":120}]'::jsonb),
+  ('posta-pure-ensalada', 'Posta a la plancha con puré y ensalada', 'almuerzos', array['alta en proteínas', 'sin gluten']::text[], 35, 1, false, null, 'Cuece las papas peladas en agua con sal hasta que estén blandas, muélelas y agrega la leche caliente y la mantequilla. Seca bien la carne, sálala y márcala en una plancha muy caliente 3 a 4 minutos por lado; déjala reposar 5 minutos antes de cortar. Sirve con la ensalada aliñada.', '[{"ingredient":"posta-negra","grams":150,"state":"raw","role":"adjustable","min_g":100,"max_g":260},{"ingredient":"papa","grams":200,"state":"raw","role":"side","min_g":0,"max_g":350},{"ingredient":"leche-descremada","grams":40,"state":"as_sold","role":"side","min_g":0,"max_g":80},{"ingredient":"mantequilla","grams":4,"state":"as_sold","role":"side","min_g":0,"max_g":8},{"ingredient":"lechuga","grams":50,"state":"raw","role":"side","min_g":0,"max_g":150},{"ingredient":"tomate","grams":60,"state":"raw","role":"side","min_g":0,"max_g":150},{"ingredient":"aceite-oliva","grams":5,"state":"as_sold","role":"ratio","ratio_group":"aliño"},{"ingredient":"vinagre","grams":4,"state":"as_sold","role":"ratio","ratio_group":"aliño"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('pasta-pollo-espinaca-ricotta', 'Pasta con pollo, espinaca y ricotta', 'almuerzos', '{}'::text[], 25, 1, false, null, 'Cocina la pasta al dente y guarda medio vaso del agua de cocción. Dora el pollo en cubos en el aceite con el ajo, agrega la espinaca y deja que se marchite. Incorpora la pasta, la ricotta y un chorrito del agua de cocción y mezcla hasta que quede cremoso. Termina con el parmesano.', '[{"ingredient":"fideos","grams":80,"state":"raw","role":"side","min_g":0,"max_g":160},{"ingredient":"pechuga-pollo","grams":110,"state":"raw","role":"adjustable","min_g":60,"max_g":220},{"ingredient":"espinaca","grams":60,"state":"raw","role":"adjustable","min_g":30,"max_g":150},{"ingredient":"ricotta","grams":40,"state":"as_sold","role":"adjustable","min_g":0,"max_g":100},{"ingredient":"queso-parmesano","grams":6,"state":"as_sold","role":"adjustable","min_g":0,"max_g":15},{"ingredient":"ajo","grams":3,"state":"raw","role":"fixed"},{"ingredient":"aceite-oliva","grams":6,"state":"as_sold","role":"adjustable","min_g":3,"max_g":10},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('carne-mechada-arroz', 'Carne mechada con arroz', 'almuerzos', array['alta en proteínas', 'batch cooking', 'congelable', 'sin gluten', 'sin lactosa']::text[], 150, 6, true, null, 'Dora la carne entera en el aceite en una olla gruesa y retírala. En la misma olla sofríe cebolla, zanahoria, pimentón y ajo; vuelve la carne, agrega tomate, especias y agua hasta cubrir la mitad. Cocina tapado a fuego mínimo 2 horas, dando vuelta la carne, hasta que se deshilache. Desmenúzala dentro de su jugo y pesa la olla. El arroz va aparte.', '[{"ingredient":"carne-guisar","grams":130,"state":"raw","role":"adjustable"},{"ingredient":"cebolla","grams":50,"state":"raw","role":"adjustable"},{"ingredient":"zanahoria","grams":40,"state":"raw","role":"adjustable"},{"ingredient":"pimenton-rojo","grams":30,"state":"raw","role":"adjustable"},{"ingredient":"tomate-conserva","grams":60,"state":"as_sold","role":"adjustable"},{"ingredient":"ajo","grams":3,"state":"raw","role":"fixed"},{"ingredient":"oregano","grams":0.3,"state":"as_sold","role":"fixed"},{"ingredient":"comino","grams":0.3,"state":"as_sold","role":"fixed"},{"ingredient":"aceite-vegetal","grams":4,"state":"as_sold","role":"adjustable"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"},{"ingredient":"arroz","grams":50,"state":"raw","role":"side","min_g":0,"max_g":100}]'::jsonb),
+  ('hamburguesas-caseras', 'Hamburguesas caseras con papas al horno y ensalada', 'cenas', array['congelable']::text[], 45, 1, false, null, 'Forma hamburguesas de 120 g con la carne y la sal, sin amasar de más. Hornea las papas en gajos con el aceite a 200 °C por 35 minutos. Cocina las hamburguesas en plancha caliente 3 a 4 minutos por lado; si lleva queso, ponlo el último minuto. Cada uno arma su plato: con o sin pan y queso.', '[{"ingredient":"carne-molida-5","grams":120,"state":"raw","role":"adjustable","min_g":120,"max_g":360,"integer_unit_g":120},{"ingredient":"papa","grams":150,"state":"raw","role":"side","min_g":0,"max_g":300},{"ingredient":"lechuga","grams":40,"state":"raw","role":"side","min_g":0,"max_g":120},{"ingredient":"tomate","grams":50,"state":"raw","role":"side","min_g":0,"max_g":120},{"ingredient":"pan-hamburguesa","grams":44,"state":"as_sold","role":"side","min_g":0,"max_g":44,"integer_unit_g":44},{"ingredient":"queso-gauda","grams":15,"state":"as_sold","role":"side","min_g":0,"max_g":30},{"ingredient":"aceite-oliva","grams":4,"state":"as_sold","role":"adjustable","min_g":2,"max_g":8},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('omelette-espinaca-champinones', 'Omelette de espinaca, champiñones y queso', 'cenas', array['alta en proteínas', 'rápida', 'vegetariana']::text[], 15, 1, false, null, 'Saltea los champiñones en la mitad del aceite hasta que suelten su agua y doren; agrega la espinaca un minuto y reserva. Bate huevos, claras y sal, cuájalos en el sartén con el resto del aceite a fuego medio-bajo, rellena con las verduras y el queso y dobla.', '[{"ingredient":"huevo","grams":100,"state":"raw","role":"adjustable","min_g":50,"max_g":150,"integer_unit_g":50},{"ingredient":"clara-huevo","grams":66,"state":"raw","role":"adjustable","min_g":0,"max_g":165,"integer_unit_g":33},{"ingredient":"espinaca","grams":40,"state":"raw","role":"adjustable","min_g":20,"max_g":100},{"ingredient":"champinones","grams":60,"state":"raw","role":"adjustable","min_g":30,"max_g":150},{"ingredient":"queso-gauda","grams":15,"state":"as_sold","role":"adjustable","min_g":0,"max_g":30},{"ingredient":"aceite-oliva","grams":3,"state":"as_sold","role":"adjustable","min_g":2,"max_g":6},{"ingredient":"sal","grams":0.5,"state":"as_sold","role":"fixed"},{"ingredient":"pan-integral","grams":32,"state":"as_sold","role":"side","min_g":0,"max_g":64,"integer_unit_g":32}]'::jsonb),
+  ('wrap-pollo-palta', 'Wrap de pollo, palta y yogur', 'cenas', array['alta en proteínas', 'rápida']::text[], 20, 1, false, null, 'Cocina el pollo a la plancha y córtalo en tiras. Mezcla el yogur con el limón y la sal. Calienta la tortilla en un sartén seco, unta el yogur, agrega lechuga, tomate, palta y pollo, y enrolla apretando los bordes.', '[{"ingredient":"tortilla-harina","grams":48,"state":"as_sold","role":"side","min_g":48,"max_g":96,"integer_unit_g":48},{"ingredient":"pechuga-pollo","grams":100,"state":"raw","role":"adjustable","min_g":60,"max_g":200},{"ingredient":"lechuga","grams":30,"state":"raw","role":"adjustable","min_g":15,"max_g":80},{"ingredient":"tomate","grams":50,"state":"raw","role":"adjustable","min_g":25,"max_g":120},{"ingredient":"palta","grams":30,"state":"raw","role":"adjustable","min_g":0,"max_g":60},{"ingredient":"yogur-griego","grams":30,"state":"as_sold","role":"adjustable","min_g":0,"max_g":60},{"ingredient":"jugo-limon","grams":3,"state":"as_sold","role":"fixed"},{"ingredient":"sal","grams":0.5,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('zapallitos-rellenos', 'Zapallitos italianos rellenos', 'cenas', array['alta en proteínas', 'sin gluten']::text[], 45, 1, false, null, 'Corta los zapallitos a lo largo y vacíalos con una cuchara, dejando 1 cm de pared. Pica la pulpa y sofríela con la cebolla en el aceite; agrega la carne, el tomate picado, orégano y sal y cocina 8 minutos. Rellena, espolvorea el parmesano y hornea a 190 °C por 25 minutos.', '[{"ingredient":"zapallo-italiano","grams":200,"state":"raw","role":"adjustable","min_g":150,"max_g":350},{"ingredient":"carne-molida-5","grams":90,"state":"raw","role":"adjustable","min_g":60,"max_g":180},{"ingredient":"cebolla","grams":30,"state":"raw","role":"adjustable","min_g":15,"max_g":60},{"ingredient":"tomate","grams":50,"state":"raw","role":"adjustable","min_g":25,"max_g":100},{"ingredient":"queso-parmesano","grams":8,"state":"as_sold","role":"adjustable","min_g":0,"max_g":15},{"ingredient":"aceite-oliva","grams":4,"state":"as_sold","role":"adjustable","min_g":2,"max_g":8},{"ingredient":"oregano","grams":0.3,"state":"as_sold","role":"fixed"},{"ingredient":"sal","grams":0.8,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('ensalada-garbanzos-pollo', 'Ensalada de garbanzos, pollo y verduras', 'cenas', array['alta en proteínas', 'rápida', 'sin gluten', 'sin lactosa']::text[], 15, 1, false, null, 'Cocina el pollo a la plancha y córtalo en cubos. Mezcla los garbanzos cocidos y escurridos con el tomate, el pepino, la cebolla en pluma, la lechuga y el perejil. Aliña con aceite, limón y sal justo antes de servir.', '[{"ingredient":"garbanzos","grams":120,"state":"cooked","role":"adjustable","min_g":60,"max_g":220},{"ingredient":"pechuga-pollo","grams":100,"state":"raw","role":"adjustable","min_g":60,"max_g":200},{"ingredient":"tomate","grams":80,"state":"raw","role":"adjustable","min_g":40,"max_g":150},{"ingredient":"pepino","grams":60,"state":"raw","role":"adjustable","min_g":30,"max_g":120},{"ingredient":"lechuga","grams":40,"state":"raw","role":"adjustable","min_g":20,"max_g":100},{"ingredient":"cebolla","grams":15,"state":"raw","role":"fixed"},{"ingredient":"perejil","grams":3,"state":"raw","role":"fixed"},{"ingredient":"aceite-oliva","grams":8,"state":"as_sold","role":"ratio","ratio_group":"aliño"},{"ingredient":"jugo-limon","grams":10,"state":"as_sold","role":"ratio","ratio_group":"aliño"},{"ingredient":"sal","grams":0.8,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('crema-zapallo', 'Crema de zapallo', 'cenas', array['batch cooking', 'congelable', 'económica', 'vegetariana']::text[], 35, 4, true, 2000, 'Sofríe la cebolla en el aceite, agrega zapallo y papa en cubos y cubre apenas con agua. Cocina 20 minutos hasta que todo esté blando, licúa con la leche y ajusta con sal y pimienta. Pesa la olla. Se congela bien en porciones.', '[{"ingredient":"zapallo-camote","grams":200,"state":"raw","role":"adjustable"},{"ingredient":"papa","grams":60,"state":"raw","role":"adjustable"},{"ingredient":"cebolla","grams":40,"state":"raw","role":"adjustable"},{"ingredient":"leche-descremada","grams":80,"state":"as_sold","role":"adjustable"},{"ingredient":"aceite-oliva","grams":4,"state":"as_sold","role":"adjustable"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"},{"ingredient":"pimienta","grams":0.2,"state":"as_sold","role":"fixed"},{"ingredient":"pan-integral","grams":32,"state":"as_sold","role":"side","min_g":0,"max_g":64,"integer_unit_g":32}]'::jsonb),
+  ('tortilla-verduras', 'Tortilla de papas y zapallo italiano', 'cenas', array['sin gluten', 'sin lactosa', 'vegetariana']::text[], 35, 4, true, null, 'Corta papas y zapallo en láminas finas y cocínalos tapados con la cebolla y el aceite a fuego bajo 15 minutos, sin dorar. Mezcla con los huevos batidos, sal y pimienta y cuaja en un sartén mediano a fuego bajo; da vuelta con un plato y termina 3 minutos. Pesa la tortilla entera y reparte por peso. La ensalada va aparte.', '[{"ingredient":"huevo","grams":100,"state":"raw","role":"adjustable"},{"ingredient":"papa","grams":120,"state":"raw","role":"adjustable"},{"ingredient":"cebolla","grams":40,"state":"raw","role":"adjustable"},{"ingredient":"zapallo-italiano","grams":80,"state":"raw","role":"adjustable"},{"ingredient":"aceite-oliva","grams":6,"state":"as_sold","role":"adjustable"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"},{"ingredient":"pimienta","grams":0.2,"state":"as_sold","role":"fixed"},{"ingredient":"lechuga","grams":50,"state":"raw","role":"side","min_g":0,"max_g":150},{"ingredient":"tomate","grams":60,"state":"raw","role":"side","min_g":0,"max_g":150}]'::jsonb),
+  ('pollo-plancha-arroz-integral-brocoli', 'Pollo a la plancha con arroz integral y brócoli', 'cenas', array['alta en proteínas', 'sin gluten', 'sin lactosa']::text[], 35, 1, false, null, 'Cocina el arroz integral (unos 35 minutos). Aplana la pechuga, adóbala con ajo, limón y sal y cocínala en plancha caliente 4 a 5 minutos por lado. Cuece el brócoli al vapor 4 minutos y aliña con el aceite.', '[{"ingredient":"pechuga-pollo","grams":150,"state":"raw","role":"adjustable","min_g":100,"max_g":280},{"ingredient":"arroz-integral","grams":60,"state":"raw","role":"side","min_g":0,"max_g":120},{"ingredient":"brocoli","grams":120,"state":"raw","role":"adjustable","min_g":60,"max_g":250},{"ingredient":"aceite-oliva","grams":6,"state":"as_sold","role":"adjustable","min_g":3,"max_g":10},{"ingredient":"jugo-limon","grams":5,"state":"as_sold","role":"fixed"},{"ingredient":"ajo","grams":2,"state":"raw","role":"fixed"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('pizza-tortilla', 'Pizza rápida en tortilla', 'cenas', array['rápida', 'vegetariana']::text[], 15, 1, false, null, 'Precalienta el horno a 220 °C. Pon la tortilla en una lata, cúbrela con la salsa, el queso, los champiñones laminados y el pimentón en tiras. Hornea 7 a 9 minutos, hasta que los bordes estén crujientes. Termina con orégano.', '[{"ingredient":"tortilla-harina","grams":48,"state":"as_sold","role":"side","min_g":48,"max_g":96,"integer_unit_g":48},{"ingredient":"salsa-tomate","grams":40,"state":"as_sold","role":"adjustable","min_g":20,"max_g":80},{"ingredient":"queso-mozzarella","grams":40,"state":"as_sold","role":"adjustable","min_g":20,"max_g":80},{"ingredient":"champinones","grams":40,"state":"raw","role":"adjustable","min_g":0,"max_g":100},{"ingredient":"pimenton-verde","grams":30,"state":"raw","role":"adjustable","min_g":0,"max_g":80},{"ingredient":"oregano","grams":0.3,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('manzana-mantequilla-mani', 'Manzana con mantequilla de maní', 'snacks', array['rápida', 'sin gluten', 'sin lactosa', 'vegetariana']::text[], 3, 1, false, null, 'Corta la manzana en gajos y acompaña con la mantequilla de maní para untar.', '[{"ingredient":"manzana","grams":150,"state":"raw","role":"adjustable","min_g":100,"max_g":220},{"ingredient":"mantequilla-mani","grams":16,"state":"as_sold","role":"adjustable","min_g":8,"max_g":32}]'::jsonb),
+  ('huevos-duros', 'Huevos duros', 'snacks', array['alta en proteínas', 'batch cooking', 'rápida', 'sin gluten', 'sin lactosa', 'vegetariana']::text[], 12, 1, false, null, 'Pon los huevos en agua hirviendo 10 minutos y pásalos a agua con hielo. Sin pelar, duran 5 días refrigerados.', '[{"ingredient":"huevo","grams":100,"state":"raw","role":"adjustable","min_g":50,"max_g":150,"integer_unit_g":50},{"ingredient":"sal","grams":0.3,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('frutos-secos-kiwi', 'Frutos secos con kiwi', 'snacks', array['rápida', 'sin gluten', 'sin lactosa', 'vegetariana']::text[], 2, 1, false, null, 'Porciona los frutos secos en un pocillo y acompaña con el kiwi pelado.', '[{"ingredient":"almendras","grams":15,"state":"as_sold","role":"adjustable","min_g":5,"max_g":30},{"ingredient":"nueces","grams":10,"state":"as_sold","role":"adjustable","min_g":0,"max_g":20},{"ingredient":"kiwi","grams":69,"state":"raw","role":"side","min_g":0,"max_g":138,"integer_unit_g":69}]'::jsonb),
+  ('hummus-palitos', 'Hummus con palitos de zanahoria y apio', 'snacks', array['batch cooking', 'rápida', 'sin gluten', 'sin lactosa', 'vegetariana']::text[], 10, 4, true, null, 'Procesa los garbanzos cocidos con el ajo, el limón, el comino y la sal, agregando el aceite y un poco de agua fría hasta lograr una crema lisa. Pesa el hummus terminado. Corta zanahoria y apio en bastones.', '[{"ingredient":"garbanzos","grams":80,"state":"cooked","role":"adjustable"},{"ingredient":"aceite-oliva","grams":8,"state":"as_sold","role":"adjustable"},{"ingredient":"jugo-limon","grams":10,"state":"as_sold","role":"adjustable"},{"ingredient":"ajo","grams":2,"state":"raw","role":"fixed"},{"ingredient":"comino","grams":0.3,"state":"as_sold","role":"fixed"},{"ingredient":"sal","grams":0.5,"state":"as_sold","role":"fixed"},{"ingredient":"zanahoria","grams":80,"state":"raw","role":"side","min_g":0,"max_g":150},{"ingredient":"apio","grams":50,"state":"raw","role":"side","min_g":0,"max_g":120}]'::jsonb),
+  ('yogur-durazno-chia', 'Yogur con durazno y chía', 'snacks', array['rápida', 'sin gluten', 'vegetariana']::text[], 3, 1, false, null, 'Mezcla el yogur con la chía y deja 5 minutos para que se hidrate. Agrega el durazno en cubos.', '[{"ingredient":"yogur-natural","grams":170,"state":"as_sold","role":"adjustable","min_g":120,"max_g":250},{"ingredient":"durazno","grams":100,"state":"raw","role":"side","min_g":0,"max_g":180},{"ingredient":"chia","grams":5,"state":"as_sold","role":"adjustable","min_g":0,"max_g":12}]'::jsonb),
+  ('manzana-asada-canela', 'Manzana asada con canela y yogur', 'postres', array['sin gluten', 'vegetariana']::text[], 30, 1, false, null, 'Saca el centro de la manzana, rellena con canela y miel y hornea a 180 °C por 25 minutos. Sirve tibia con el yogur.', '[{"ingredient":"manzana","grams":180,"state":"raw","role":"adjustable","min_g":120,"max_g":250},{"ingredient":"canela","grams":1,"state":"as_sold","role":"fixed"},{"ingredient":"miel","grams":5,"state":"as_sold","role":"adjustable","min_g":0,"max_g":10},{"ingredient":"yogur-griego","grams":60,"state":"as_sold","role":"side","min_g":0,"max_g":120}]'::jsonb),
+  ('yogur-cacao-frambuesas', 'Yogur griego con cacao y frambuesas', 'postres', array['alta en proteínas', 'rápida', 'sin gluten', 'vegetariana']::text[], 3, 1, false, null, 'Mezcla el yogur con el cacao y la miel hasta que no queden grumos. Sirve con las frambuesas encima.', '[{"ingredient":"yogur-griego","grams":170,"state":"as_sold","role":"adjustable","min_g":100,"max_g":250},{"ingredient":"cacao","grams":5,"state":"as_sold","role":"adjustable","min_g":3,"max_g":10},{"ingredient":"miel","grams":8,"state":"as_sold","role":"adjustable","min_g":0,"max_g":12},{"ingredient":"frambuesas","grams":60,"state":"raw","role":"side","min_g":0,"max_g":120}]'::jsonb),
+  ('salsa-pomodoro', 'Salsa pomodoro casera', 'preparaciones_base', array['batch cooking', 'congelable', 'sin gluten', 'sin lactosa', 'vegetariana']::text[], 35, 6, true, 870, 'Sofríe la cebolla picada muy fina en el aceite a fuego bajo 8 minutos y agrega el ajo un minuto. Incorpora el tomate aplastado y cocina destapado 20 a 25 minutos, hasta que reduzca y espese. Sala, agrega la albahaca al final y pesa la salsa. Se congela en porciones.', '[{"ingredient":"tomate-conserva","grams":150,"state":"as_sold","role":"adjustable"},{"ingredient":"cebolla","grams":20,"state":"raw","role":"adjustable"},{"ingredient":"ajo","grams":3,"state":"raw","role":"fixed"},{"ingredient":"aceite-oliva","grams":5,"state":"as_sold","role":"adjustable"},{"ingredient":"albahaca","grams":2,"state":"raw","role":"fixed"},{"ingredient":"sal","grams":1,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('arroz-graneado', 'Arroz graneado', 'preparaciones_base', array['batch cooking', 'congelable', 'sin gluten', 'sin lactosa', 'vegetariana']::text[], 25, 6, true, null, 'Lava el arroz hasta que el agua salga clara. Dóralo un par de minutos en el aceite con el ajo, agrega el doble de su volumen en agua hirviendo con sal y cocina tapado a fuego mínimo 15 minutos. Reposa 5 minutos, suelta con tenedor y pesa el arroz cocido.', '[{"ingredient":"arroz","grams":60,"state":"raw","role":"adjustable"},{"ingredient":"aceite-vegetal","grams":2,"state":"as_sold","role":"adjustable"},{"ingredient":"ajo","grams":1,"state":"raw","role":"fixed"},{"ingredient":"sal","grams":0.8,"state":"as_sold","role":"fixed"}]'::jsonb),
+  ('pollo-desmenuzado', 'Pollo desmenuzado para la semana', 'preparaciones_base', array['alta en proteínas', 'batch cooking', 'congelable', 'sin gluten', 'sin lactosa']::text[], 35, 6, true, null, 'Cuece las pechugas en agua apenas hirviendo con cebolla, zanahoria, ajo, orégano y sal, 15 a 18 minutos. Deja enfriar en el caldo, desmenuza con dos tenedores y pesa el pollo escurrido. Sirve para wraps, ensaladas y salteados durante la semana.', '[{"ingredient":"pechuga-pollo","grams":150,"state":"raw","role":"adjustable"},{"ingredient":"cebolla","grams":20,"state":"raw","role":"adjustable"},{"ingredient":"zanahoria","grams":20,"state":"raw","role":"adjustable"},{"ingredient":"ajo","grams":2,"state":"raw","role":"fixed"},{"ingredient":"oregano","grams":0.3,"state":"as_sold","role":"fixed"},{"ingredient":"sal","grams":0.8,"state":"as_sold","role":"fixed"}]'::jsonb)
+) as v(slug, name, category, tags, prep, servings, homog, yield_g, instructions, lines)
+on conflict (slug) do update set
+  name = excluded.name, category = excluded.category, tags = excluded.tags, prep_minutes = excluded.prep_minutes,
+  servings_nominal = excluded.servings_nominal, is_homogeneous = excluded.is_homogeneous,
+  expected_cooked_yield_g = excluded.expected_cooked_yield_g, instructions = excluded.instructions,
+  lines = excluded.lines, catalog_version = public.recipe_catalog.catalog_version + 1, updated_at = now();
+
+-- Cada hogar existente recibe las recetas del catálogo que le falten
+select public._import_catalog_recipes(h.id) from public.households h;

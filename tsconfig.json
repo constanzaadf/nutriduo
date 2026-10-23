@@ -3,11 +3,26 @@
   "compilerOptions": {
     "noEmit": true,
     "paths": {
-      "@nutriduo/domain": ["./packages/domain/src/index.ts"],
-      "@nutriduo/nutrition-engine": ["./packages/nutrition-engine/src/index.ts"],
-      "@nutriduo/portion-engine": ["./packages/portion-engine/src/index.ts"],
-      "@nutriduo/shopping-engine": ["./packages/shopping-engine/src/index.ts"]
+      "@nutriduo/domain": [
+        "./packages/domain/src/index.ts"
+      ],
+      "@nutriduo/nutrition-engine": [
+        "./packages/nutrition-engine/src/index.ts"
+      ],
+      "@nutriduo/portion-engine": [
+        "./packages/portion-engine/src/index.ts"
+      ],
+      "@nutriduo/shopping-engine": [
+        "./packages/shopping-engine/src/index.ts"
+      ],
+      "@nutriduo/catalog": [
+        "./packages/catalog/src/index.ts"
+      ]
     }
   },
-  "include": ["./packages/*/src/**/*.ts", "packages/*/test/**/*.ts"]
+  "include": [
+    "./packages/*/src/**/*.ts",
+    "packages/*/test/**/*.ts",
+    "packages/*/scripts/**/*.ts"
+  ]
 }
